@@ -8,14 +8,14 @@ pub const VRF_SEED: &[u8]      = b"vrf_request";
 /// Replace with actual deployed prediction-market program ID before deploy.
 use anchor_lang::prelude::Pubkey;
 pub const PREDICTION_MARKET_PROGRAM_ID: Pubkey = solana_program::pubkey!(
-    "HWHvQhFmJB3NUcu1aihKmrKegfVxBEHzwLhQYx1wB1Zf"
+    "H76M7bbm6zwE464xkabF5MWbciwZqK9FmZYf4omaqnQH"
 );
 
 /// Ludo board
 pub const BOARD_TRACK_LEN: u8  = 52; // main track squares
 pub const HOME_STRETCH_LEN: u8 = 5;  // coloured home stretch
 pub const HOME_POSITION: u8    = 99; // sentinel: pawn is home
-pub const STARTING_SQUARE: u8  = 0;  // off-board sentinel
+pub const STARTING_SQUARE: u8  = 255;  // off-board sentinel
 
 pub const PAWNS_PER_PLAYER: u8 = 4;
 pub const TOTAL_PLAYERS: u8    = 4;

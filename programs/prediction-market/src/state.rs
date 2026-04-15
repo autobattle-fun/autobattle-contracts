@@ -13,18 +13,17 @@ pub enum Outcome {
 #[account]
 pub struct Market {
     pub game_id:          u64,          // 8
-    pub market_index:     u8,           // 1  (0-3 = win markets, 4+ = live)
+    pub market_index:     u8,           // 1  
     pub question:         String,       // 4 + 128
-    pub yes_supply:       u64,          // 8  — total YES shares outstanding
-    pub no_supply:        u64,          // 8  — total NO shares outstanding
-    pub total_volume:     u64,          // 8  — cumulative $AUTO traded
+    pub yes_supply:       u64,          // 8
+    pub no_supply:        u64,          // 8
+    pub total_volume:     u64,          // 8
     pub resolved:         bool,         // 1
     pub outcome:          Option<Outcome>, // 2
     pub expires_at:       i64,          // 8
     pub created_at:       i64,          // 8
-    /// Number of UserPosition accounts that still have unclaimed shares.
-    /// Vault can only close when this reaches 0.
     pub claims_remaining: u64,          // 8
+    pub fee_balance:      u64,          // 8  <-- NEW FIELD (Tracks uncollected fees)
     pub bump:             u8,           // 1
     pub vault_bump:       u8,           // 1
 }
@@ -37,8 +36,9 @@ impl Market {
         + 1 + 2                  // resolved, outcome
         + 8 + 8                  // expires_at, created_at
         + 8                      // claims_remaining
+        + 8                      // fee_balance
         + 1 + 1                  // bumps
-        + 32;                    // headroom
+        + 24;                    // headroom (Reduced from 32 to 24 to keep size identical)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

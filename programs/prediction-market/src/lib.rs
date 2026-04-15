@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use solana_program::program::invoke_signed;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
-declare_id!("HWHvQhFmJB3NUcu1aihKmrKegfVxBEHzwLhQYx1wB1Zf");
+declare_id!("H76M7bbm6zwE464xkabF5MWbciwZqK9FmZYf4omaqnQH");
 
 pub mod errors;
 pub mod state;
@@ -29,7 +29,7 @@ pub const REFUND_GRACE_SECS: i64 = 7_200;
 /// Game engine program ID — target of the unlock_upgrade CPI.
 /// Replace with actual deployed game-engine program ID.
 pub const GAME_ENGINE_PROGRAM_ID: Pubkey =
-    solana_program::pubkey!("GameEng1neXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+    solana_program::pubkey!("GxLT8QMUw6cVT6HQBu2c2zepbQnhUWr4VPEB2vfggE2e");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Program
@@ -66,6 +66,7 @@ pub mod prediction_market {
         m.expires_at      = expires_at;
         m.created_at      = clock.unix_timestamp;
         m.claims_remaining = 0;
+        m.fee_balance     = 0; // Initialize fee tracker
         m.bump            = ctx.bumps.market;
         m.vault_bump      = ctx.bumps.vault;
 
@@ -95,12 +96,18 @@ pub mod prediction_market {
         require!(clock.unix_timestamp < m.expires_at,  MarketError::MarketExpired);
         require!(amount_in > 0,                        MarketError::ZeroAmount);
 
+        // 1. Calculate 0.5% fee and net trade amount
+        let fee = amount_in.checked_mul(5).ok_or(MarketError::Overflow)?
+            .checked_div(1000).ok_or(MarketError::Overflow)?;
+        let trade_amount = amount_in.checked_sub(fee).ok_or(MarketError::Overflow)?;
+
+        // 2. Calculate shares out based on net trade amount
         let shares_out = lmsr::calc_shares_out(
-            m.yes_supply, m.no_supply, LMSR_B_SCALED, outcome, amount_in,
+            m.yes_supply, m.no_supply, LMSR_B_SCALED, outcome, trade_amount,
         )?;
         require!(shares_out >= min_shares_out, MarketError::SlippageExceeded);
 
-        // Transfer $AUTO user → vault
+        // 3. Transfer full amount_in user → vault
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -113,14 +120,15 @@ pub mod prediction_market {
             amount_in,
         )?;
 
-        // Update supplies
+        // 4. Update supplies, volume, and track fees
         match outcome {
             Outcome::Yes => m.yes_supply = m.yes_supply.checked_add(shares_out).ok_or(MarketError::Overflow)?,
             Outcome::No  => m.no_supply  = m.no_supply.checked_add(shares_out).ok_or(MarketError::Overflow)?,
         }
-        m.total_volume = m.total_volume.checked_add(amount_in).ok_or(MarketError::Overflow)?;
+        m.total_volume = m.total_volume.checked_add(trade_amount).ok_or(MarketError::Overflow)?;
+        m.fee_balance  = m.fee_balance.checked_add(fee).ok_or(MarketError::Overflow)?;
 
-        // Init UserPosition if first time
+        // 5. Init UserPosition if first time
         let pos = &mut ctx.accounts.user_position;
         if pos.user == Pubkey::default() {
             pos.user         = ctx.accounts.user.key();
@@ -163,12 +171,21 @@ pub mod prediction_market {
             Outcome::No  => require!(pos.no_shares  >= shares_in, MarketError::InsufficientShares),
         }
 
-        let amount_out = lmsr::calc_amount_out(
+        // 1. Calculate raw payout
+        let gross_amount_out = lmsr::calc_amount_out(
             m.yes_supply, m.no_supply, LMSR_B_SCALED, outcome, shares_in,
         )?;
-        require!(amount_out >= min_amount_out, MarketError::SlippageExceeded);
+        
+        // 2. Subtract 0.5% fee
+        let fee = gross_amount_out.checked_mul(5).ok_or(MarketError::Overflow)?
+            .checked_div(1000).ok_or(MarketError::Overflow)?;
+        let net_amount_out = gross_amount_out.checked_sub(fee).ok_or(MarketError::Overflow)?;
+        
+        require!(net_amount_out >= min_amount_out, MarketError::SlippageExceeded);
 
-        // Transfer $AUTO vault → user (vault signs as PDA)
+        m.fee_balance = m.fee_balance.checked_add(fee).ok_or(MarketError::Overflow)?;
+
+        // 3. Transfer net_amount_out vault → user
         let game_id_bytes   = m.game_id.to_le_bytes();
         let market_idx      = [m.market_index];
         let vault_bump      = [m.vault_bump];
@@ -183,7 +200,7 @@ pub mod prediction_market {
                 },
                 &[vault_seeds],
             ),
-            amount_out,
+            net_amount_out,
         )?;
 
         match outcome {
@@ -235,7 +252,7 @@ pub mod prediction_market {
 
     /// Winning position holder claims their $AUTO payout.
     /// After the last claim, CPIs into game-engine to clear upgrade_locked.
-    pub fn claim_payout(ctx: Context<ClaimPayout>) -> Result<()> {
+   pub fn claim_payout(ctx: Context<ClaimPayout>) -> Result<()> {
         {
             let m   = &ctx.accounts.market;
             let pos = &ctx.accounts.user_position;
@@ -255,7 +272,11 @@ pub mod prediction_market {
                 Outcome::No  => m.no_supply,
             };
 
-            let vault_balance = ctx.accounts.vault.amount;
+            // Deduct the collected fees before calculating the payout ratio
+            let vault_balance = ctx.accounts.vault.amount
+                .checked_sub(m.fee_balance)
+                .ok_or(MarketError::Overflow)?;
+                
             let payout = (user_winning_shares as u128)
                 .checked_mul(vault_balance as u128).ok_or(MarketError::Overflow)?
                 .checked_div(total_winning as u128).ok_or(MarketError::Overflow)? as u64;
@@ -285,12 +306,10 @@ pub mod prediction_market {
             });
         }
 
-        // Mutate after immutable borrows are dropped
         ctx.accounts.user_position.claimed = true;
         ctx.accounts.market.claims_remaining =
             ctx.accounts.market.claims_remaining.saturating_sub(1);
 
-        // ── CPI: unlock_upgrade once this was the last claim ──────────────────
         if ctx.accounts.market.claims_remaining == 0 {
             maybe_unlock_upgrade(&ctx)?;
         }
@@ -314,7 +333,11 @@ pub mod prediction_market {
             let total_shares  = m.yes_supply + m.no_supply;
             require!(total_shares > 0, MarketError::ZeroAmount);
 
-            let vault_balance = ctx.accounts.vault.amount;
+            // Deduct the collected fees before calculating the refund ratio
+            let vault_balance = ctx.accounts.vault.amount
+                .checked_sub(m.fee_balance)
+                .ok_or(MarketError::Overflow)?;
+                
             let refund = (user_shares as u128)
                 .checked_mul(vault_balance as u128).ok_or(MarketError::Overflow)?
                 .checked_div(total_shares as u128).ok_or(MarketError::Overflow)? as u64;

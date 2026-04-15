@@ -8,7 +8,7 @@ pub mod state;
 
 use instructions::*;
 
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+declare_id!("GxLT8QMUw6cVT6HQBu2c2zepbQnhUWr4VPEB2vfggE2e");
 
 #[program]
 pub mod game_engine {

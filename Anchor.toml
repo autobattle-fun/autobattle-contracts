@@ -3,8 +3,8 @@ seeds = false
 skip-lint = false
 
 [programs.localnet]
-game_engine       = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
-prediction_market = "HWHvQhFmJB3NUcu1aihKmrKegfVxBEHzwLhQYx1wB1Zf"
+game_engine       = "GxLT8QMUw6cVT6HQBu2c2zepbQnhUWr4VPEB2vfggE2e"
+prediction_market = "H76M7bbm6zwE464xkabF5MWbciwZqK9FmZYf4omaqnQH"
 
 [registry]
 url = "https://api.apr.dev"
