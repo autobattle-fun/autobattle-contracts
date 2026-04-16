@@ -73,4 +73,13 @@ pub enum LudoError {
 
     #[msg("Account is not owned by the Switchboard program")]
     InvalidVrfAccount,
+
+    #[msg("Randomness has expired or slot mismatch")]
+    RandomnessExpired,
+
+    #[msg("Randomness already revealed")]
+    RandomnessAlreadyRevealed,
+
+    #[msg("Randomness not yet resolved by oracle")]
+    RandomnessNotResolved,
 }

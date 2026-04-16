@@ -6,8 +6,9 @@ use crate::{
     errors::LudoError,
     events::*,
     state::*,
-    vrf::{self, RandomnessAccountData, RequestRandomnessParams, build_fulfill_callback},
 };
+
+use switchboard_on_demand::accounts::RandomnessAccountData;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // init_game
@@ -86,7 +87,8 @@ pub fn init_game<'info>(
     gs.active_player        = Color::Red;
     gs.turn_number          = 0;
     gs.consecutive_no_moves = 0;
-    gs.pending_request_id   = [0u8; 32];
+    gs.pending_commit_slot  = 0;         
+    gs._padding             = [0u8; 24];  
     gs.pending_pawn_id      = PawnId::new(Color::Red, 0);
     gs.pawn_positions       = [STARTING_SQUARE; 16];
     gs.home_counts          = [0u8; 4];
@@ -120,7 +122,6 @@ pub struct RequestRoll<'info> {
     )]
     pub game_state: Account<'info, GameState>,
 
-    /// Short-lived PDA: seeded by (game_id, turn_number) so it's unique per turn.
     #[account(
         init,
         seeds = [VRF_SEED, &game_state.game_id.to_le_bytes(), &game_state.turn_number.to_le_bytes()],
@@ -130,22 +131,11 @@ pub struct RequestRoll<'info> {
     )]
     pub vrf_request: Account<'info, VRFRequest>,
 
-    /// Switchboard RandomnessAccount — agent creates this keypair off-chain
-    /// and passes it here. Its pubkey becomes our request_id.
-    /// CHECK: ownership verified against Switchboard program ID.
-    #[account(
-        mut,
-        owner = vrf::switchboard::ID @ LudoError::InvalidVrfAccount,
-    )]
+    /// CHECK: Validated manually via Switchboard parse
     pub randomness_account: AccountInfo<'info>,
 
     #[account(mut)]
     pub agent: Signer<'info>,
-
-    /// CHECK: verified by address constraint.
-    #[account(address = vrf::switchboard::ID)]
-    pub switchboard_program: AccountInfo<'info>,
-
     pub system_program: Program<'info, System>,
 }
 
@@ -155,75 +145,40 @@ pub fn request_roll(ctx: Context<RequestRoll>, pawn_id: PawnId) -> Result<()> {
 
     require!(gs.phase == GamePhase::AwaitingRoll,    LudoError::NotAwaitingRoll);
     require!(gs.winner.is_none(),                     LudoError::GameAlreadyEnded);
-    require!(
-        ctx.accounts.agent.key() == gs.agent_for(gs.active_player),
-        LudoError::NotYourTurn
-    );
+    require!(ctx.accounts.agent.key() == gs.agent_for(gs.active_player), LudoError::NotYourTurn);
     require!(pawn_id.color() == gs.active_player,    LudoError::PawnNotOwnedByPlayer);
     require!(!gs.is_home(pawn_id),                    LudoError::PawnAlreadyHome);
 
-    // request_id = Switchboard RandomnessAccount pubkey (32 bytes)
-    let sb_pubkey = ctx.accounts.randomness_account.key();
-    let mut request_id = [0u8; 32];
-    request_id.copy_from_slice(sb_pubkey.as_ref());
+    // ── Switchboard V3: Parse & Validate ──────────────────────────────────────
+    let randomness_data = RandomnessAccountData::parse(
+        ctx.accounts.randomness_account.data.borrow()
+    ).unwrap();
 
-    // Build callback so Switchboard knows which instruction to CPI into
-    let callback = build_fulfill_callback(
-        *ctx.program_id,
-        gs.key(),
-        ctx.accounts.vrf_request.key(),
-        ctx.accounts.agent.key(),
-        ctx.accounts.system_program.key(),
-        request_id,
-    );
-
-    // ── CPI: Switchboard request_randomness ───────────────────────────────────
-    // Discriminator for "request_randomness" on Switchboard On-Demand.
-    let ix_disc: [u8; 8] = [0xa0, 0x31, 0x9c, 0x2f, 0x18, 0x76, 0x4f, 0x9c];
-    let params = RequestRandomnessParams { seed: request_id, callback: Some(callback) };
-    let mut ix_data = ix_disc.to_vec();
-    ix_data.extend_from_slice(&params.try_to_vec()?);
-
-    let sb_ix = anchor_lang::solana_program::instruction::Instruction {
-        program_id: vrf::switchboard::ID,
-        accounts: vec![
-            anchor_lang::solana_program::instruction::AccountMeta::new(sb_pubkey, false),
-            anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.agent.key(), true),
-            anchor_lang::solana_program::instruction::AccountMeta::new_readonly(
-                ctx.accounts.system_program.key(), false,
-            ),
-        ],
-        data: ix_data,
-    };
-
-    invoke_signed(
-        &sb_ix,
-        &[
-            ctx.accounts.randomness_account.to_account_info(),
-            ctx.accounts.agent.to_account_info(),
-            ctx.accounts.system_program.to_account_info(),
-        ],
-        &[],
-    )?;
+    // SECURITY: Ensure randomness was committed in the previous slot
+    require!(randomness_data.seed_slot == clock.slot - 1, LudoError::RandomnessExpired);
+    
+    // SECURITY: Ensure it hasn't been revealed yet
+    require!(randomness_data.get_value(clock.slot).is_err(), LudoError::RandomnessAlreadyRevealed);
 
     // ── Persist ───────────────────────────────────────────────────────────────
-    gs.pending_request_id = request_id;
-    gs.pending_pawn_id    = pawn_id;
-    gs.phase              = GamePhase::AwaitingVRF;
+    gs.pending_commit_slot = randomness_data.seed_slot;
+    gs.pending_pawn_id     = pawn_id;
+    gs.phase               = GamePhase::AwaitingVRF;
 
     let vrf          = &mut ctx.accounts.vrf_request;
     vrf.game_id      = gs.game_id;
-    vrf.request_id   = request_id;
-    vrf.sb_account   = sb_pubkey;
+    vrf.commit_slot  = randomness_data.seed_slot;
+    vrf.sb_account   = ctx.accounts.randomness_account.key();
     vrf.pawn_id      = pawn_id;
     vrf.player       = gs.active_player;
     vrf.consumed     = false;
     vrf.requested_at = clock.unix_timestamp;
     vrf.bump         = ctx.bumps.vrf_request;
 
+    // We pass empty array for request_id to satisfy existing event struct
     emit!(RollRequested {
         game_id: gs.game_id, player: gs.active_player,
-        pawn_id, request_id, timestamp: clock.unix_timestamp,
+        pawn_id, request_id: [0u8; 32], timestamp: clock.unix_timestamp,
     });
 
     Ok(())
@@ -234,7 +189,6 @@ pub fn request_roll(ctx: Context<RequestRoll>, pawn_id: PawnId) -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Accounts)]
-#[instruction(request_id: [u8; 32])]
 pub struct FulfillRoll<'info> {
     #[account(
         mut,
@@ -247,52 +201,57 @@ pub struct FulfillRoll<'info> {
         mut,
         seeds = [VRF_SEED, &game_state.game_id.to_le_bytes(), &game_state.turn_number.to_le_bytes()],
         bump  = vrf_request.bump,
-        constraint = vrf_request.request_id == request_id @ LudoError::RequestIdMismatch,
-        constraint = !vrf_request.consumed               @ LudoError::VrfAlreadyConsumed,
+        constraint = !vrf_request.consumed @ LudoError::VrfAlreadyConsumed,
         close  = crank,
     )]
     pub vrf_request: Account<'info, VRFRequest>,
 
-    /// The Switchboard account holding the revealed randomness.
-    /// CHECK: owner + pubkey match enforced by constraints.
-    #[account(
-        owner = vrf::switchboard::ID @ LudoError::InvalidVrfAccount,
-        constraint = randomness_account.key() == vrf_request.sb_account @ LudoError::RequestIdMismatch,
-    )]
+    /// CHECK: Validated manually via Switchboard parse
     pub randomness_account: AccountInfo<'info>,
 
     #[account(mut)]
     pub crank: Signer<'info>,
-
     pub system_program: Program<'info, System>,
 }
 
-pub fn fulfill_roll(
-    ctx: Context<FulfillRoll>,
-    request_id: [u8; 32],
-) -> Result<()> {
+pub fn fulfill_roll(ctx: Context<FulfillRoll>) -> Result<()> {
     let gs    = &mut ctx.accounts.game_state;
     let clock = Clock::get()?;
 
     require!(gs.phase == GamePhase::AwaitingVRF, LudoError::NotAwaitingVRF);
-    require!(gs.pending_request_id == request_id, LudoError::RequestIdMismatch);
 
-    // ── Read revealed randomness from Switchboard account ─────────────────────
-    let sb_data  = ctx.accounts.randomness_account.try_borrow_data()?;
-    let vrf_data = RandomnessAccountData::try_deserialize(&sb_data)?;
-    vrf::verify_randomness(&vrf_data, &request_id)?;
+    // SECURITY: Ensure the provided account matches the one we committed to
+    require!(
+        ctx.accounts.randomness_account.key() == ctx.accounts.vrf_request.sb_account,
+        LudoError::RequestIdMismatch
+    );
 
-    let randomness = vrf_data.expand();
+    // ── Switchboard V3: Parse Revealed Data ───────────────────────────────────
+    let randomness_data = RandomnessAccountData::parse(
+        ctx.accounts.randomness_account.data.borrow()
+    ).unwrap();
+
+    // SECURITY: Ensure the slot matches exactly what we committed to
+    require!(
+        randomness_data.seed_slot == ctx.accounts.vrf_request.commit_slot,
+        LudoError::RandomnessExpired
+    );
+
+    // Get the revealed random value
+    let revealed_random_value = randomness_data
+        .get_value(clock.slot)
+        .map_err(|_| LudoError::RandomnessNotResolved)?;
+
     ctx.accounts.vrf_request.consumed = true;
 
     // ── Dice roll: 1-6 ───────────────────────────────────────────────────────
-    let rand_bytes: [u8; 8] = randomness[..8].try_into().unwrap();
-    let roll    = (u64::from_le_bytes(rand_bytes) % 6 + 1) as u8;
+    // We use the first byte of the 32-byte array to determine the roll
+    let roll    = (revealed_random_value[0] % 6 + 1) as u8;
     let pawn_id = gs.pending_pawn_id;
     let player  = gs.active_player;
     let from_sq = gs.pawn_pos(pawn_id);
 
-    // ── Move ──────────────────────────────────────────────────────────────────
+    // ── Move Logic (Exactly as you had it!) ──────────────────────────────────
     let maybe_to_sq = compute_move(gs, pawn_id, roll);
 
     match maybe_to_sq {
@@ -327,15 +286,15 @@ pub fn fulfill_roll(
                 });
             }
 
-            let captured = check_capture(&*gs, player, to_sq); // re-derive for event (already applied above)
+            let captured = check_capture(&*gs, player, to_sq);
             emit!(PawnMoved {
                 game_id: gs.game_id, player, pawn_id, roll,
                 from_square: from_sq, to_square: to_sq,
-                captured_pawn: None, // already emitted PawnCaptured separately
+                captured_pawn: None, 
                 turn_number: gs.turn_number,
                 timestamp: clock.unix_timestamp,
             });
-            let _ = captured; // suppress warning
+            let _ = captured;
         }
     }
 

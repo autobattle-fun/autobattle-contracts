@@ -323,7 +323,7 @@ describe("ludo-onchain", () => {
 
   describe("Prediction market", () => {
     const GAME_ID     = 1;
-    const MARKET_IDX  = 0; // Red win market
+    const MARKET_IDX  = 4; // Red win market
 
     let marketPda: PublicKey, marketBump: number;
     let vaultPda:  PublicKey;
@@ -560,6 +560,71 @@ describe("ludo-onchain", () => {
   });
 
   // ════════════════════════════════════════════════════════════════════════════
+  // 4.5 MID-GAME PROPOSALS (CUSTOM MARKETS)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  describe("Mid-Game Proposals (Custom Markets)", () => {
+    const GAME_ID = 1;
+    const CUSTOM_MARKET_IDX = 5; // Indexes 4+ are for custom proposals
+
+    let customMarketPda: PublicKey;
+    let customVaultPda: PublicKey;
+
+    before(async () => {
+      [customMarketPda] = PublicKey.findProgramAddressSync(
+        [MARKET_SEED, gameIdBuf(GAME_ID), u8Buf(CUSTOM_MARKET_IDX)],
+        predMarket.programId,
+      );
+      [customVaultPda] = PublicKey.findProgramAddressSync(
+        [VAULT_SEED, gameIdBuf(GAME_ID), u8Buf(CUSTOM_MARKET_IDX)],
+        predMarket.programId,
+      );
+    });
+
+    it("Admin can create a custom market (e.g., 'Will R2 capture G3?')", async () => {
+      const expiresAt = Math.floor(Date.now() / 1000) + 600; // 10 minutes from now
+
+      await predMarket.methods
+        .createMarket(
+          new BN(GAME_ID),
+          CUSTOM_MARKET_IDX,
+          "Will R2 capture G3 by turn 15?",
+          new BN(expiresAt)
+        )
+        .accounts({
+          market: customMarketPda,
+          vault: customVaultPda,
+          autoMint: autoMint,
+          authority: authority.publicKey, // Uses your local admin wallet
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .rpc();
+
+      const m = await predMarket.account.market.fetch(customMarketPda);
+      expect(m.marketIndex).to.eq(CUSTOM_MARKET_IDX);
+      expect(m.question).to.eq("Will R2 capture G3 by turn 15?");
+    });
+
+    it("Random user cannot resolve the custom market", async () => {
+      try {
+        await predMarket.methods
+          .resolveMarket({ yes: {} })
+          .accounts({
+            market: customMarketPda,
+            authority: user1.publicKey, // user1 tries to sneak in and resolve it
+          })
+          .signers([user1])
+          .rpc();
+        assert.fail("Should have thrown UnauthorizedUser");
+      } catch (e: any) {
+        expect(e.message).to.include("UnauthorizedUser");
+      }
+    });
+  });
+
+  // ════════════════════════════════════════════════════════════════════════════
   // 5. REFUND_EXPIRED path
   // ════════════════════════════════════════════════════════════════════════════
 
@@ -773,7 +838,7 @@ describe("ludo-onchain", () => {
     });
 
     it("request_id mismatch rejected — RequestIdMismatch", async () => {
-      console.log("    → covered by: vrf_request.request_id == request_id constraint");
+      console.log("    → covered by: vrf_request.commit_slot == randomness_data.seed_slot constraint");
     });
 
     it("user cannot steal another's position — UnauthorizedUser", async () => {

@@ -103,8 +103,9 @@ pub struct GameState {
     pub consecutive_no_moves: u8,   // 4  — tracks skipped turns for forfeit
 
     // VRF linkage — set in request_roll, cleared in fulfill_roll
-    pub pending_request_id: [u8; 32], // 32
-    pub pending_pawn_id: PawnId,    // 1  — pawn committed before seeing roll
+    pub pending_commit_slot: u64,   // 8
+    pub _padding: [u8; 24],         // 24 (Keeps the 32-byte alignment so we don't break PDA size)
+    pub pending_pawn_id: PawnId,    // 1
 
     // Board: square number for each pawn (flat index, see PawnId::flat())
     // 0           = in yard (not yet entered)
@@ -181,17 +182,15 @@ impl GameState {
 #[account]
 pub struct VRFRequest {
     pub game_id:      u64,       // 8
-    /// = Switchboard RandomnessAccount pubkey (used as request_id)
-    pub request_id:   [u8; 32],  // 32
-    /// Explicit Switchboard account pubkey — verified in fulfill_roll
+    pub commit_slot:  u64,       // 8 
     pub sb_account:   Pubkey,    // 32
-    pub pawn_id:      PawnId,    // 1  — pawn committed before seeing roll
+    pub pawn_id:      PawnId,    // 1
     pub player:       Color,     // 1
-    pub consumed:     bool,      // 1  — replay protection
+    pub consumed:     bool,      // 1
     pub requested_at: i64,       // 8
     pub bump:         u8,        // 1
 }
 
 impl VRFRequest {
-    pub const LEN: usize = 8 + 8 + 32 + 32 + 1 + 1 + 1 + 8 + 1 + 32; // +32 headroom
+    pub const LEN: usize = 8 + 8 + 8 + 32 + 1 + 1 + 1 + 8 + 1 + 56; 
 }

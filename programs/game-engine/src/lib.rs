@@ -53,11 +53,8 @@ pub mod game_engine {
     }
 
     /// Switchboard oracle CPI callback: reads randomness, moves pawn, checks win.
-    pub fn fulfill_roll(
-        ctx: Context<FulfillRoll>,
-        request_id: [u8; 32],
-    ) -> Result<()> {
-        instructions::game::fulfill_roll(ctx, request_id)
+    pub fn fulfill_roll(ctx: Context<FulfillRoll>) -> Result<()> {
+        instructions::game::fulfill_roll(ctx)
     }
 
     /// Finalise game: CPI into prediction-market to resolve all 4 win markets.

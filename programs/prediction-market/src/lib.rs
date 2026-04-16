@@ -19,6 +19,9 @@ pub const MARKET_SEED: &[u8]    = b"market";
 pub const VAULT_SEED: &[u8]     = b"vault";
 pub const POSITION_SEED: &[u8]  = b"position";
 
+/// The wallet used by the Deforge AI Backend to resolve mid-game proposals
+pub const ADMIN_PUBKEY: Pubkey = solana_program::pubkey!("G2eWnQNwc1wrrgE78NcjmLBXXT9h2s9iUwAM1C8kpFzK");
+
 /// LMSR liquidity parameter b, scaled to 6 decimals (= 100 $AUTO).
 /// Tune upward for deeper markets with less price impact per trade.
 pub const LMSR_B_SCALED: u64    = 100_000_000;
@@ -51,6 +54,7 @@ pub mod prediction_market {
         question: String,
         expires_at: i64,
     ) -> Result<()> {
+        require!(ctx.accounts.authority.key() == ADMIN_PUBKEY, MarketError::UnauthorizedUser);
         require!(question.len() <= 128, MarketError::QuestionTooLong);
         let clock = Clock::get()?;
 
@@ -232,6 +236,22 @@ pub mod prediction_market {
     ) -> Result<()> {
         let m = &mut ctx.accounts.market;
         require!(!m.resolved, MarketError::MarketAlreadyResolved);
+
+        let signer = ctx.accounts.authority.key();
+
+        if m.market_index <= 3 {
+            // ── MAIN WIN MARKETS (0-3) ──
+            // Must ONLY be resolved by the GameState PDA via CPI from the Game Engine
+            let (expected_game_state_pda, _) = Pubkey::find_program_address(
+                &[b"game", &m.game_id.to_le_bytes()],
+                &GAME_ENGINE_PROGRAM_ID
+            );
+            require!(signer == expected_game_state_pda, MarketError::UnauthorizedUser);
+        } else {
+            // ── MID-GAME PROPOSALS (4+) ──
+            // Must ONLY be resolved by your backend/Deforge AI agent
+            require!(signer == ADMIN_PUBKEY, MarketError::UnauthorizedUser);
+        }
 
         m.resolved = true;
         m.outcome  = Some(outcome);
