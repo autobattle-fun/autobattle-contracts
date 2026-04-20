@@ -40,4 +40,7 @@ pub enum MarketError {
 
     #[msg("Amount must be greater than zero")]
     ZeroAmount,
+
+    #[msg("Bet size exceeds the mathematical limits of the AMM")]
+    BetTooLarge,
 }

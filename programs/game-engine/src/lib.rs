@@ -14,8 +14,6 @@ declare_id!("GxLT8QMUw6cVT6HQBu2c2zepbQnhUWr4VPEB2vfggE2e");
 pub mod game_engine {
     use super::*;
 
-    // ── Registry ──────────────────────────────────────────────────────────────
-
     pub fn initialize_registry(
         ctx: Context<InitializeRegistry>,
         cooldown_duration: i64,
@@ -30,41 +28,42 @@ pub mod game_engine {
         instructions::registry::update_cooldown(ctx, new_duration)
     }
 
-    // ── Game lifecycle ────────────────────────────────────────────────────────
-
-    /// Crank: start a new game after cooldown elapses.
-    /// Pass previous GameState PDA as remaining_accounts[0] when game_count > 0.
     pub fn init_game<'info>(
         ctx: Context<'_, '_, 'info, 'info, InitGame<'info>>, 
         agent_red: Pubkey, 
         agent_blue: Pubkey, 
-        agent_yellow: Pubkey, 
-        agent_green: Pubkey
     ) -> Result<()> {
-        instructions::game::init_game(ctx, agent_red, agent_blue, agent_yellow, agent_green)
+        instructions::game::init_game(ctx, agent_red, agent_blue)
     }
 
-    /// Active agent commits to a pawn and requests Switchboard randomness.
-    pub fn request_roll(
+    pub fn request_vrf(
         ctx: Context<RequestRoll>,
-        pawn_id: state::PawnId,
+        roll_type: u8,
     ) -> Result<()> {
-        instructions::game::request_roll(ctx, pawn_id)
+        instructions::game::request_vrf(ctx, roll_type)
     }
 
-    /// Switchboard oracle CPI callback: reads randomness, moves pawn, checks win.
-    pub fn fulfill_roll(ctx: Context<FulfillRoll>) -> Result<()> {
-        instructions::game::fulfill_roll(ctx)
+    pub fn fulfill_vrf(ctx: Context<FulfillRoll>) -> Result<()> {
+        instructions::game::fulfill_vrf(ctx)
     }
 
-    /// Finalise game: CPI into prediction-market to resolve all 4 win markets.
-    /// Pass 4 Market PDAs (one per color) as remaining_accounts[0..3].
-    pub fn end_game<'info>(ctx: Context<'_, '_, 'info, 'info, EndGame<'info>>) -> Result<()> {
-        instructions::game::end_game(ctx)
+    pub fn stay(ctx: Context<Action>, player: state::Color) -> Result<()> {
+        instructions::game::stay(ctx, player)
     }
 
-    /// Called via CPI from prediction-market once all claims_remaining == 0.
+    pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'info>>) -> Result<()> {
+        instructions::game::resolve_round(ctx)
+    }
+
     pub fn unlock_upgrade(ctx: Context<UnlockUpgrade>) -> Result<()> {
         instructions::game::unlock_upgrade(ctx)
     }
+
+    // pub fn mock_fulfill_vrf(ctx: Context<MockFulfillRoll>, random_bytes: [u8; 2]) -> Result<()> {
+    //     instructions::game::mock_fulfill_vrf(ctx, random_bytes)
+    // }
+
+    // pub fn mock_request_vrf(ctx: Context<RequestRoll>, roll_type: u8) -> Result<()> {
+    //     instructions::game::mock_request_vrf(ctx, roll_type)
+    // }
 }

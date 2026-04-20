@@ -1,444 +1,366 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke_signed;
-
-use crate::{
-    constants::*,
-    errors::LudoError,
-    events::*,
-    state::*,
-};
-
 use switchboard_on_demand::accounts::RandomnessAccountData;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// init_game
-// ─────────────────────────────────────────────────────────────────────────────
+use crate::{constants::*, errors::GameError, events::*, state::*};
+
+// ── Contexts ─────────────────────────────────────────────────────────────────
 
 #[derive(Accounts)]
-#[instruction(
-    agent_red: Pubkey,
-    agent_blue: Pubkey,
-    agent_yellow: Pubkey,
-    agent_green: Pubkey,
-)]
 pub struct InitGame<'info> {
-    #[account(
-        mut,
-        seeds = [REGISTRY_SEED],
-        bump  = registry.bump,
-    )]
+    #[account(mut, seeds = [REGISTRY_SEED], bump = registry.bump)]
     pub registry: Account<'info, Registry>,
-
     #[account(
         init,
         seeds = [GAME_SEED, &(registry.game_count + 1).to_le_bytes()],
         bump,
-        payer  = crank,
-        space  = GameState::LEN,
+        payer = crank,
+        space = GameState::LEN,
     )]
     pub game_state: Account<'info, GameState>,
-
-    /// Anyone can crank a new game. Clock check (see handler) prevents early firing.
     #[account(mut)]
     pub crank: Signer<'info>,
-
     pub system_program: Program<'info, System>,
-    // remaining_accounts[0] = previous GameState PDA (required when game_count > 0)
 }
+
+// #[derive(Accounts)]
+// pub struct MockFulfillRoll<'info> {
+//     #[account(mut, seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()], bump = game_state.bump)]
+//     pub game_state: Account<'info, GameState>,
+//     #[account(
+//         mut,
+//         seeds = [VRF_SEED, &game_state.game_id.to_le_bytes()],
+//         bump = vrf_request.bump,
+//         close = crank,
+//     )]
+//     pub vrf_request: Account<'info, VRFRequest>,
+//     #[account(mut)]
+//     pub crank: Signer<'info>, 
+// }
+
+#[derive(Accounts)]
+#[instruction(roll_type: u8)]
+pub struct RequestRoll<'info> {
+    #[account(mut, seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()], bump = game_state.bump)]
+    pub game_state: Account<'info, GameState>,
+    #[account(
+        init,
+        seeds = [VRF_SEED, &game_state.game_id.to_le_bytes()],
+        bump,
+        payer = agent,
+        space = VRFRequest::LEN,
+    )]
+    pub vrf_request: Account<'info, VRFRequest>,
+    /// CHECK: Validated manually via Switchboard parse
+    pub randomness_account: AccountInfo<'info>,
+    #[account(mut)]
+    pub agent: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FulfillRoll<'info> {
+    #[account(mut, seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()], bump = game_state.bump)]
+    pub game_state: Account<'info, GameState>,
+    #[account(
+        mut,
+        seeds = [VRF_SEED, &game_state.game_id.to_le_bytes()],
+        bump = vrf_request.bump,
+        close = crank,
+    )]
+    pub vrf_request: Account<'info, VRFRequest>,
+    /// CHECK: Validated manually via Switchboard parse
+    pub randomness_account: AccountInfo<'info>,
+    #[account(mut)]
+    pub crank: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Action<'info> {
+    #[account(mut, seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()], bump = game_state.bump)]
+    pub game_state: Account<'info, GameState>,
+    #[account(mut)]
+    pub agent: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ResolveRound<'info> {
+    #[account(mut, seeds = [REGISTRY_SEED], bump = registry.bump)]
+    pub registry: Account<'info, Registry>,
+    #[account(mut, seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()], bump = game_state.bump)]
+    pub game_state: Account<'info, GameState>,
+    #[account(mut)]
+    pub crank: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UnlockUpgrade<'info> {
+    #[account(mut, seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()], bump = game_state.bump)]
+    pub game_state: Account<'info, GameState>,
+    /// CHECK: Address verified by constant
+    #[account(address = PREDICTION_MARKET_PROGRAM_ID)]
+    pub prediction_market_program: Signer<'info>,
+}
+
+// ── Instruction Logic ────────────────────────────────────────────────────────
 
 pub fn init_game<'info>(
     ctx: Context<'_, '_, 'info, 'info, InitGame<'info>>,
     agent_red: Pubkey,
     agent_blue: Pubkey,
-    agent_yellow: Pubkey,
-    agent_green: Pubkey,
 ) -> Result<()> {
     let reg   = &mut ctx.accounts.registry;
     let clock = Clock::get()?;
 
-    // ── Cooldown guard ────────────────────────────────────────────────────────
-    if reg.game_count > 0 {
-        let prev_info = ctx.remaining_accounts
-            .get(0)
-            .ok_or(LudoError::MissingPrevGameState)?;
-
-        let prev_gs: Account<GameState> = Account::try_from(prev_info)?;
-
-        let (expected_pda, _) = Pubkey::find_program_address(
-            &[GAME_SEED, &reg.current_game_id.to_le_bytes()],
-            ctx.program_id,
-        );
-        require!(prev_info.key() == expected_pda, LudoError::InvalidPrevGameState);
-        require!(
-            clock.unix_timestamp >= prev_gs.next_game_starts_at,
-            LudoError::CooldownNotOver
-        );
-    }
-
-    let new_game_id = reg.game_count.checked_add(1).ok_or(LudoError::Overflow)?;
+    let new_game_id = reg.game_count.checked_add(1).unwrap();
     reg.game_count      = new_game_id;
     reg.current_game_id = new_game_id;
     reg.game_active     = true;
 
     let gs = &mut ctx.accounts.game_state;
     gs.game_id              = new_game_id;
-    gs.agents               = [agent_red, agent_blue, agent_yellow, agent_green];
-    gs.phase                = GamePhase::AwaitingRoll;
+    gs.agent_red            = agent_red;
+    gs.agent_blue           = agent_blue;
+    gs.p1_hp                = 10;
+    gs.p2_hp                = 10;
+    gs.p1_score             = 0;
+    gs.p2_score             = 0;
+    gs.p1_aces              = 0;
+    gs.p2_aces              = 0;
+    gs.p1_stayed            = false;
+    gs.p2_stayed            = false;
+    gs.round_number         = 1;
+    gs.phase                = GamePhase::AwaitingInitialDeal;
     gs.active_player        = Color::Red;
-    gs.turn_number          = 0;
-    gs.consecutive_no_moves = 0;
-    gs.pending_commit_slot  = 0;         
-    gs._padding             = [0u8; 24];  
-    gs.pending_pawn_id      = PawnId::new(Color::Red, 0);
-    gs.pawn_positions       = [STARTING_SQUARE; 16];
-    gs.home_counts          = [0u8; 4];
     gs.winner               = None;
     gs.created_at           = clock.unix_timestamp;
-    gs.ended_at             = 0;
-    gs.next_game_starts_at  = 0;
     gs.upgrade_locked       = true;
     gs.bump                 = ctx.bumps.game_state;
 
     emit!(GameInitialised {
         game_id: new_game_id,
-        agent_red, agent_blue, agent_yellow, agent_green,
+        agent_red,
+        agent_blue,
         starts_at: clock.unix_timestamp,
     });
 
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// request_roll  — Switchboard On-Demand CPI
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Accounts)]
-#[instruction(pawn_id: PawnId)]
-pub struct RequestRoll<'info> {
-    #[account(
-        mut,
-        seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()],
-        bump  = game_state.bump,
-    )]
-    pub game_state: Account<'info, GameState>,
-
-    #[account(
-        init,
-        seeds = [VRF_SEED, &game_state.game_id.to_le_bytes(), &game_state.turn_number.to_le_bytes()],
-        bump,
-        payer = agent,
-        space = VRFRequest::LEN,
-    )]
-    pub vrf_request: Account<'info, VRFRequest>,
-
-    /// CHECK: Validated manually via Switchboard parse
-    pub randomness_account: AccountInfo<'info>,
-
-    #[account(mut)]
-    pub agent: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-pub fn request_roll(ctx: Context<RequestRoll>, pawn_id: PawnId) -> Result<()> {
+pub fn request_vrf(ctx: Context<RequestRoll>, roll_type: u8) -> Result<()> {
     let gs    = &mut ctx.accounts.game_state;
     let clock = Clock::get()?;
 
-    require!(gs.phase == GamePhase::AwaitingRoll,    LudoError::NotAwaitingRoll);
-    require!(gs.winner.is_none(),                     LudoError::GameAlreadyEnded);
-    require!(ctx.accounts.agent.key() == gs.agent_for(gs.active_player), LudoError::NotYourTurn);
-    require!(pawn_id.color() == gs.active_player,    LudoError::PawnNotOwnedByPlayer);
-    require!(!gs.is_home(pawn_id),                    LudoError::PawnAlreadyHome);
+    if roll_type == 0 {
+        require!(gs.phase == GamePhase::AwaitingInitialDeal, GameError::InvalidPhase);
+    } else if roll_type == 1 {
+        require!(gs.phase == GamePhase::AwaitingAction, GameError::InvalidPhase);
+        require!(ctx.accounts.agent.key() == gs.agent_for(gs.active_player), GameError::NotYourTurn);
+        let score = if gs.active_player == Color::Red { gs.p1_score } else { gs.p2_score };
+        require!(score <= 21, GameError::Over21CannotHit); 
+    } else if roll_type == 2 {
+        require!(gs.phase == GamePhase::AwaitingFinalRevealVRF, GameError::InvalidPhase);
+    } else if roll_type == 3 {
+        require!(gs.phase == GamePhase::AwaitingTiebreakerVRF, GameError::InvalidPhase);
+    }
 
-    // ── Switchboard V3: Parse & Validate ──────────────────────────────────────
-    let randomness_data = RandomnessAccountData::parse(
-        ctx.accounts.randomness_account.data.borrow()
-    ).unwrap();
+    let randomness_data = RandomnessAccountData::parse(ctx.accounts.randomness_account.data.borrow()).unwrap();
+    require!(randomness_data.seed_slot == clock.slot - 1, GameError::RandomnessExpired);
+    require!(randomness_data.get_value(clock.slot).is_err(), GameError::RandomnessAlreadyRevealed);
 
-    // SECURITY: Ensure randomness was committed in the previous slot
-    require!(randomness_data.seed_slot == clock.slot - 1, LudoError::RandomnessExpired);
-    
-    // SECURITY: Ensure it hasn't been revealed yet
-    require!(randomness_data.get_value(clock.slot).is_err(), LudoError::RandomnessAlreadyRevealed);
-
-    // ── Persist ───────────────────────────────────────────────────────────────
     gs.pending_commit_slot = randomness_data.seed_slot;
-    gs.pending_pawn_id     = pawn_id;
-    gs.phase               = GamePhase::AwaitingVRF;
+    
+    gs.phase = match roll_type {
+        0 => GamePhase::AwaitingInitialDeal,
+        1 => GamePhase::AwaitingHitVRF,
+        2 => GamePhase::AwaitingFinalRevealVRF,
+        _ => GamePhase::AwaitingTiebreakerVRF,
+    };
 
-    let vrf          = &mut ctx.accounts.vrf_request;
-    vrf.game_id      = gs.game_id;
-    vrf.commit_slot  = randomness_data.seed_slot;
-    vrf.sb_account   = ctx.accounts.randomness_account.key();
-    vrf.pawn_id      = pawn_id;
-    vrf.player       = gs.active_player;
-    vrf.consumed     = false;
-    vrf.requested_at = clock.unix_timestamp;
-    vrf.bump         = ctx.bumps.vrf_request;
+    let vrf = &mut ctx.accounts.vrf_request;
+    vrf.game_id = gs.game_id;
+    vrf.commit_slot = randomness_data.seed_slot;
+    vrf.sb_account = ctx.accounts.randomness_account.key();
+    vrf.player = gs.active_player;
+    vrf.roll_type = roll_type;
+    vrf.consumed = false;
+    vrf.bump = ctx.bumps.vrf_request;
 
-    // We pass empty array for request_id to satisfy existing event struct
-    emit!(RollRequested {
-        game_id: gs.game_id, player: gs.active_player,
-        pawn_id, request_id: [0u8; 32], timestamp: clock.unix_timestamp,
+    emit!(VrfRequested {
+        game_id: gs.game_id,
+        player: gs.active_player,
+        roll_type,
+        timestamp: clock.unix_timestamp,
     });
 
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// fulfill_roll  — invoked by Switchboard oracle as a CPI callback
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Accounts)]
-pub struct FulfillRoll<'info> {
-    #[account(
-        mut,
-        seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()],
-        bump  = game_state.bump,
-    )]
-    pub game_state: Account<'info, GameState>,
-
-    #[account(
-        mut,
-        seeds = [VRF_SEED, &game_state.game_id.to_le_bytes(), &game_state.turn_number.to_le_bytes()],
-        bump  = vrf_request.bump,
-        constraint = !vrf_request.consumed @ LudoError::VrfAlreadyConsumed,
-        close  = crank,
-    )]
-    pub vrf_request: Account<'info, VRFRequest>,
-
-    /// CHECK: Validated manually via Switchboard parse
-    pub randomness_account: AccountInfo<'info>,
-
-    #[account(mut)]
-    pub crank: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-pub fn fulfill_roll(ctx: Context<FulfillRoll>) -> Result<()> {
-    let gs    = &mut ctx.accounts.game_state;
+pub fn fulfill_vrf(ctx: Context<FulfillRoll>) -> Result<()> {
     let clock = Clock::get()?;
 
-    require!(gs.phase == GamePhase::AwaitingVRF, LudoError::NotAwaitingVRF);
-
-    // SECURITY: Ensure the provided account matches the one we committed to
-    require!(
-        ctx.accounts.randomness_account.key() == ctx.accounts.vrf_request.sb_account,
-        LudoError::RequestIdMismatch
-    );
-
-    // ── Switchboard V3: Parse Revealed Data ───────────────────────────────────
-    let randomness_data = RandomnessAccountData::parse(
-        ctx.accounts.randomness_account.data.borrow()
-    ).unwrap();
-
-    // SECURITY: Ensure the slot matches exactly what we committed to
-    require!(
-        randomness_data.seed_slot == ctx.accounts.vrf_request.commit_slot,
-        LudoError::RandomnessExpired
-    );
-
-    // Get the revealed random value
-    let revealed_random_value = randomness_data
-        .get_value(clock.slot)
-        .map_err(|_| LudoError::RandomnessNotResolved)?;
-
+    let randomness_data = RandomnessAccountData::parse(ctx.accounts.randomness_account.data.borrow()).unwrap();
+    let revealed_random_value = randomness_data.get_value(clock.slot).map_err(|_| GameError::RandomnessNotResolved)?;
     ctx.accounts.vrf_request.consumed = true;
 
-    // ── Dice roll: 1-6 ───────────────────────────────────────────────────────
-    // We use the first byte of the 32-byte array to determine the roll
-    let roll    = (revealed_random_value[0] % 6 + 1) as u8;
-    let pawn_id = gs.pending_pawn_id;
-    let player  = gs.active_player;
-    let from_sq = gs.pawn_pos(pawn_id);
-
-    // ── Move Logic (Exactly as you had it!) ──────────────────────────────────
-    let maybe_to_sq = compute_move(gs, pawn_id, roll);
-
-    match maybe_to_sq {
-        None => {
-            gs.consecutive_no_moves += 1;
-            emit!(PawnMoved {
-                game_id: gs.game_id, player, pawn_id, roll,
-                from_square: from_sq, to_square: from_sq,
-                captured_pawn: None, turn_number: gs.turn_number,
-                timestamp: clock.unix_timestamp,
-            });
-        }
-        Some(to_sq) => {
-            gs.consecutive_no_moves = 0;
-
-            if let Some(cap) = check_capture(gs, player, to_sq) {
-                gs.set_pawn_pos(cap, STARTING_SQUARE);
-                emit!(PawnCaptured {
-                    game_id: gs.game_id, capturing_player: player,
-                    captured_player: cap.color(), captured_pawn_id: cap,
-                    square: to_sq, turn_number: gs.turn_number,
-                });
-            }
-
-            gs.set_pawn_pos(pawn_id, to_sq);
-
-            if to_sq == HOME_POSITION {
-                gs.home_counts[player as usize] += 1;
-                emit!(PawnReachedHome {
-                    game_id: gs.game_id, player, pawn_id,
-                    pawns_home_count: gs.home_counts[player as usize],
-                });
-            }
-
-            let captured = check_capture(&*gs, player, to_sq);
-            emit!(PawnMoved {
-                game_id: gs.game_id, player, pawn_id, roll,
-                from_square: from_sq, to_square: to_sq,
-                captured_pawn: None, 
-                turn_number: gs.turn_number,
-                timestamp: clock.unix_timestamp,
-            });
-            let _ = captured;
-        }
-    }
-
-    // ── Win check ─────────────────────────────────────────────────────────────
-    if gs.home_counts[player as usize] == PAWNS_PER_PLAYER {
-        gs.winner              = Some(player);
-        gs.phase               = GamePhase::Ended;
-        gs.ended_at            = clock.unix_timestamp;
-        gs.next_game_starts_at = clock.unix_timestamp
-            .checked_add(DEFAULT_COOLDOWN_SECS)
-            .ok_or(LudoError::Overflow)?;
-
-        emit!(GameEnded {
-            game_id: gs.game_id, winner: player,
-            winner_agent: gs.agent_for(player),
-            turn_count: gs.turn_number,
-            ended_at: gs.ended_at,
-            next_game_starts_at: gs.next_game_starts_at,
-        });
-        return Ok(());
-    }
-
-    // ── Advance turn ──────────────────────────────────────────────────────────
-    if roll != 6 || maybe_to_sq.is_none() {
-        gs.active_player = next_player(gs.active_player);
-    }
-    gs.turn_number = gs.turn_number.checked_add(1).ok_or(LudoError::Overflow)?;
-    gs.phase       = GamePhase::AwaitingRoll;
-
-    emit!(TurnAdvanced {
-        game_id: gs.game_id, turn_number: gs.turn_number,
-        active_player: gs.active_player, board_snapshot: gs.snapshot(),
-    });
-
-    Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// end_game  — CPIs into prediction-market to resolve all 4 win markets
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Accounts)]
-pub struct EndGame<'info> {
-    #[account(
-        mut,
-        seeds = [REGISTRY_SEED],
-        bump  = registry.bump,
-    )]
-    pub registry: Account<'info, Registry>,
-
-    #[account(
-        mut,
-        seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()],
-        bump  = game_state.bump,
-        constraint = game_state.game_id == registry.current_game_id @ LudoError::InvalidGameId,
-    )]
-    pub game_state: Account<'info, GameState>,
-
-    /// CHECK: prediction-market program ID verified via constant.
-    #[account(address = PREDICTION_MARKET_PROGRAM_ID)]
-    pub prediction_market_program: AccountInfo<'info>,
-
-    pub crank: Signer<'info>,
-    pub system_program: Program<'info, System>,
-
-    // remaining_accounts layout:
-    // [0] Market PDA for Color::Red   (market_index = 0)
-    // [1] Market PDA for Color::Blue  (market_index = 1)
-    // [2] Market PDA for Color::Yellow(market_index = 2)
-    // [3] Market PDA for Color::Green (market_index = 3)
-}
-
-pub fn end_game<'info>(ctx: Context<'_, '_, 'info, 'info, EndGame<'info>>) -> Result<()> {
+    // FIX: Double deref (**gs) extracts the raw GameState struct from the Anchor Account wrapper
     let gs = &mut ctx.accounts.game_state;
-    require!(gs.phase == GamePhase::Ended, LudoError::GameNotEnded);
+    let inner = &mut **gs; 
 
-    let winner = gs.winner.ok_or(LudoError::GameNotEnded)?;
+    if ctx.accounts.vrf_request.roll_type == 0 {
+        // Now Rust allows the disjoint borrows perfectly
+        apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
+        apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
+        inner.phase = GamePhase::AwaitingAction;
 
-    let rem = ctx.remaining_accounts;
-    require!(rem.len() >= 4, LudoError::MissingMarketAccounts);
+        emit!(CardsDealt {
+            game_id: inner.game_id,
+            p1_score: inner.p1_score,
+            p2_score: inner.p2_score,
+            is_final_reveal: false,
+        });
 
-    // Anchor discriminator for prediction_market::resolve_market
-    let disc = anchor_discriminator(b"global:resolve_market");
+    } else if ctx.accounts.vrf_request.roll_type == 1 {
+        if inner.active_player == Color::Red {
+            apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
+            if inner.p1_score >= 21 { inner.p1_stayed = true; }
+        } else {
+            apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[0]);
+            if inner.p2_score >= 21 { inner.p2_stayed = true; }
+        }
+        
+        emit!(PlayerHit {
+            game_id: inner.game_id,
+            player: inner.active_player,
+            new_score: if inner.active_player == Color::Red { inner.p1_score } else { inner.p2_score },
+        });
 
-    let game_id_bytes  = gs.game_id.to_le_bytes();
-    let gs_bump        = gs.bump;
-    let signer_seeds: &[&[&[u8]]] = &[&[GAME_SEED, &game_id_bytes, &[gs_bump]]];
+        if inner.active_player == Color::Red && !inner.p2_stayed {
+            inner.active_player = Color::Blue;
+        } else if inner.active_player == Color::Blue && !inner.p1_stayed {
+            inner.active_player = Color::Red;
+        }
 
-    for color_idx in 0u8..4 {
-        let color        = Color::from_index(color_idx).unwrap();
-        let market_info  = &rem[color_idx as usize];
-
-        // Outcome::Yes(0) for winner, Outcome::No(1) for losers
-        let outcome_byte: u8 = if color == winner { 0 } else { 1 };
-
-        let mut ix_data = disc.to_vec();
-        ix_data.push(outcome_byte);
-
-        let ix = anchor_lang::solana_program::instruction::Instruction {
-            program_id: PREDICTION_MARKET_PROGRAM_ID,
-            accounts: vec![
-                anchor_lang::solana_program::instruction::AccountMeta::new(
-                    market_info.key(), false,
-                ),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(
-                    ctx.accounts.game_state.key(), false, // PDA authority
-                ),
-            ],
-            data: ix_data,
+        inner.phase = if inner.p1_stayed && inner.p2_stayed {
+            GamePhase::AwaitingFinalRevealVRF
+        } else {
+            GamePhase::AwaitingAction
         };
 
-        invoke_signed(
-            &ix,
-            &[
-                market_info.to_account_info(),
-                ctx.accounts.game_state.to_account_info(),
-            ],
-            signer_seeds,
-        )?;
+    } else if ctx.accounts.vrf_request.roll_type == 2 {
+        apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
+        apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
+        
+        inner.phase = GamePhase::ReadyToResolve;
+
+        emit!(CardsDealt {
+            game_id: inner.game_id,
+            p1_score: inner.p1_score,
+            p2_score: inner.p2_score,
+            is_final_reveal: true,
+        });
+    } else if ctx.accounts.vrf_request.roll_type == 3 {
+        // NEW: Tiebreaker logic
+        apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
+        apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
+        
+        inner.phase = GamePhase::ReadyToResolve;
+
+        emit!(CardsDealt {
+            game_id: inner.game_id,
+            p1_score: inner.p1_score,
+            p2_score: inner.p2_score,
+            is_final_reveal: true, // Acts the same as a reveal for the UI
+        });
+    }
+    Ok(())
+}
+
+pub fn stay(ctx: Context<Action>, player: Color) -> Result<()> {
+    let gs = &mut ctx.accounts.game_state;
+    require!(gs.phase == GamePhase::AwaitingAction, GameError::InvalidPhase);
+    require!(ctx.accounts.agent.key() == gs.agent_for(player), GameError::NotYourTurn);
+
+    if player == Color::Red {
+        gs.p1_stayed = true;
+        if !gs.p2_stayed { gs.active_player = Color::Blue; }
+    } else {
+        gs.p2_stayed = true;
+        if !gs.p1_stayed { gs.active_player = Color::Red; }
     }
 
-    ctx.accounts.registry.game_active = false;
-    // upgrade_locked cleared by prediction-market CPI once claims settle
+    emit!(PlayerStayed {
+        game_id: gs.game_id,
+        player,
+    });
+
+    if gs.p1_stayed && gs.p2_stayed {
+        gs.phase = GamePhase::AwaitingFinalRevealVRF;
+    }
 
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// unlock_upgrade  — CPI'd from prediction-market once all claims_remaining == 0
-// ─────────────────────────────────────────────────────────────────────────────
+pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'info>>) -> Result<()> {
+    let gs = &mut ctx.accounts.game_state;
+    require!(gs.phase == GamePhase::ReadyToResolve, GameError::InvalidPhase);
 
-#[derive(Accounts)]
-pub struct UnlockUpgrade<'info> {
-    #[account(
-        mut,
-        seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()],
-        bump  = game_state.bump,
-    )]
-    pub game_state: Account<'info, GameState>,
+    let p1_diff = gs.p1_score.abs_diff(21);
+    let p2_diff = gs.p2_score.abs_diff(21);
 
-    /// Only the prediction-market program (as a PDA signer) may call this.
-    /// CHECK: address enforced by constant.
-    #[account(address = PREDICTION_MARKET_PROGRAM_ID)]
-    pub prediction_market_program: Signer<'info>,
+    if p1_diff == p2_diff {
+        gs.phase = GamePhase::AwaitingTiebreakerVRF;
+        return Ok(()); 
+    }
+
+    let damage = 1 << (gs.round_number.saturating_sub(1));
+    let mut round_winner = None;
+
+    if p1_diff < p2_diff {
+        gs.p2_hp = gs.p2_hp.saturating_sub(damage);
+        round_winner = Some(Color::Red);
+    } else if p2_diff < p1_diff {
+        gs.p1_hp = gs.p1_hp.saturating_sub(damage);
+        round_winner = Some(Color::Blue);
+    } 
+
+    emit!(RoundResolved {
+        game_id: gs.game_id,
+        round_number: gs.round_number,
+        p1_hp: gs.p1_hp,
+        p2_hp: gs.p2_hp,
+        damage_dealt: if round_winner.is_some() { damage } else { 0 },
+    });
+
+    if let Some(winner) = round_winner {
+        resolve_market_cpi(gs, &ctx.remaining_accounts[0], winner)?;
+    }
+
+    if gs.p1_hp == 0 || gs.p2_hp == 0 {
+        gs.phase = GamePhase::Ended;
+        gs.winner = if gs.p1_hp > 0 { Some(Color::Red) } else { Some(Color::Blue) };
+        ctx.accounts.registry.game_active = false;
+
+        emit!(GameEnded {
+            game_id: gs.game_id,
+            winner: gs.winner.unwrap(),
+            winner_agent: gs.agent_for(gs.winner.unwrap()),
+            total_rounds: gs.round_number,
+            ended_at: Clock::get()?.unix_timestamp,
+        });
+
+        resolve_market_cpi(gs, &ctx.remaining_accounts[1], gs.winner.unwrap())?;
+    } else {
+        gs.p1_score = 0;
+        gs.p2_score = 0;
+        gs.p1_aces = 0;
+        gs.p2_aces = 0;
+        gs.p1_stayed = false;
+        gs.p2_stayed = false;
+        gs.round_number += 1;
+        gs.phase = GamePhase::AwaitingInitialDeal;
+    }
+    Ok(())
 }
 
 pub fn unlock_upgrade(ctx: Context<UnlockUpgrade>) -> Result<()> {
@@ -446,54 +368,109 @@ pub fn unlock_upgrade(ctx: Context<UnlockUpgrade>) -> Result<()> {
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Board helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn compute_move(gs: &GameState, pawn: PawnId, roll: u8) -> Option<u8> {
-    let pos = gs.pawn_pos(pawn);
+// pub fn mock_request_vrf(ctx: Context<RequestRoll>, roll_type: u8) -> Result<()> {
+//     let gs = &mut ctx.accounts.game_state;
 
-    if pos == HOME_POSITION   { return None; }
-    if pos == STARTING_SQUARE {
-        return if roll == 6 { Some(pawn.color().entry_square()) } else { None };
+//     gs.phase = match roll_type {
+//         0 => GamePhase::AwaitingInitialDeal,
+//         1 => GamePhase::AwaitingHitVRF,
+//         _ => GamePhase::AwaitingFinalRevealVRF,
+//     };
+
+//     let vrf = &mut ctx.accounts.vrf_request;
+//     vrf.game_id = gs.game_id;
+//     // Mock the commit slot to match the UI expectation
+//     vrf.commit_slot = Clock::get()?.slot;
+//     vrf.sb_account = ctx.accounts.randomness_account.key();
+//     vrf.player = gs.active_player;
+//     vrf.roll_type = roll_type;
+//     vrf.consumed = false;
+//     vrf.bump = ctx.bumps.vrf_request;
+
+//     Ok(())
+// }
+
+// pub fn mock_fulfill_vrf(ctx: Context<MockFulfillRoll>, random_bytes: [u8; 2]) -> Result<()> {
+//     let gs = &mut ctx.accounts.game_state;
+//     let inner = &mut **gs;
+//     ctx.accounts.vrf_request.consumed = true;
+
+//     if ctx.accounts.vrf_request.roll_type == 0 {
+//         apply_card(&mut inner.p1_score, &mut inner.p1_aces, random_bytes[0]);
+//         apply_card(&mut inner.p2_score, &mut inner.p2_aces, random_bytes[1]);
+//         inner.phase = GamePhase::AwaitingAction;
+//     } else if ctx.accounts.vrf_request.roll_type == 1 {
+//         if inner.active_player == Color::Red {
+//             apply_card(&mut inner.p1_score, &mut inner.p1_aces, random_bytes[0]);
+//             if inner.p1_score >= 21 { inner.p1_stayed = true; }
+//         } else {
+//             apply_card(&mut inner.p2_score, &mut inner.p2_aces, random_bytes[0]);
+//             if inner.p2_score >= 21 { inner.p2_stayed = true; }
+//         }
+        
+//         if inner.active_player == Color::Red && !inner.p2_stayed {
+//             inner.active_player = Color::Blue;
+//         } else if inner.active_player == Color::Blue && !inner.p1_stayed {
+//             inner.active_player = Color::Red;
+//         }
+
+//         inner.phase = if inner.p1_stayed && inner.p2_stayed {
+//             GamePhase::AwaitingFinalRevealVRF
+//         } else {
+//             GamePhase::AwaitingAction
+//         };
+//     } else if ctx.accounts.vrf_request.roll_type == 2 || ctx.accounts.vrf_request.roll_type == 3 {
+//         apply_card(&mut inner.p1_score, &mut inner.p1_aces, random_bytes[0]);
+//         apply_card(&mut inner.p2_score, &mut inner.p2_aces, random_bytes[1]);
+//         inner.phase = GamePhase::ReadyToResolve;
+//     }
+//     Ok(())
+// }
+
+fn apply_card(score: &mut u8, aces: &mut u8, random_byte: u8) {
+    let raw = (random_byte % 13) + 1;
+    let mut value = if raw > 10 { 10 } else { raw };
+    
+    if value == 1 {
+        value = 11;
+        *aces += 1;
     }
-
-    let entry   = pawn.color().entry_square() as u16;
-    let current = pos as u16;
-    let track   = BOARD_TRACK_LEN as u16;
-
-    let travelled     = if current >= entry { current - entry } else { track - entry + current };
-    let new_travelled = travelled + roll as u16;
-    let total_journey = track + HOME_STRETCH_LEN as u16;
-
-    match new_travelled.cmp(&total_journey) {
-        std::cmp::Ordering::Greater => None,
-        std::cmp::Ordering::Equal   => Some(HOME_POSITION),
-        std::cmp::Ordering::Less => {
-            if new_travelled >= track {
-                Some(52 + (new_travelled - track + 1) as u8) // home stretch: 53-57
-            } else {
-                Some(((entry + new_travelled) % track) as u8)
-            }
-        }
+    
+    *score += value;
+    
+    while *score > 21 && *aces > 0 {
+        *score -= 10;
+        *aces -= 1;
     }
 }
 
-fn check_capture(gs: &GameState, attacker: Color, to_sq: u8) -> Option<PawnId> {
-    if SAFE_SQUARES.contains(&to_sq) || to_sq >= 53 { return None; }
-    for ci in 0..4u8 {
-        let color = Color::from_index(ci).unwrap();
-        if color == attacker { continue; }
-        for pi in 0..4u8 {
-            let pawn = PawnId::new(color, pi);
-            if gs.pawn_pos(pawn) == to_sq { return Some(pawn); }
-        }
-    }
-    None
-}
+fn resolve_market_cpi<'info>(
+    gs: &Account<'info, GameState>, 
+    market_info: &AccountInfo<'info>, 
+    winner: Color
+) -> Result<()> {
+    let disc = anchor_discriminator(b"global:resolve_market");
+    let outcome_byte: u8 = if winner == Color::Red { 0 } else { 1 }; 
 
-fn next_player(c: Color) -> Color {
-    Color::from_index((c as u8 + 1) % 4).unwrap()
+    let mut ix_data = disc.to_vec();
+    ix_data.push(outcome_byte);
+
+    let game_id_bytes  = gs.game_id.to_le_bytes();
+    let signer_seeds: &[&[&[u8]]] = &[&[GAME_SEED, &game_id_bytes, &[gs.bump]]];
+
+    let ix = solana_program::instruction::Instruction {
+        program_id: PREDICTION_MARKET_PROGRAM_ID,
+        accounts: vec![
+            solana_program::instruction::AccountMeta::new(market_info.key(), false),
+            solana_program::instruction::AccountMeta::new_readonly(gs.key(), true), 
+        ],
+        data: ix_data,
+    };
+
+    invoke_signed(&ix, &[market_info.clone(), gs.to_account_info()], signer_seeds)?;
+    Ok(())
 }
 
 fn anchor_discriminator(preimage: &[u8]) -> [u8; 8] {

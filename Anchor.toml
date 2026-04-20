@@ -10,7 +10,7 @@ prediction_market = "H76M7bbm6zwE464xkabF5MWbciwZqK9FmZYf4omaqnQH"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "devnet"
+cluster = "Localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]

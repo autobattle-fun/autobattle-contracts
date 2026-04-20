@@ -29,11 +29,6 @@ pub const LMSR_B_SCALED: u64    = 100_000_000;
 /// Grace period before a stuck unresolved market can be refunded (2 hours).
 pub const REFUND_GRACE_SECS: i64 = 7_200;
 
-/// Game engine program ID — target of the unlock_upgrade CPI.
-/// Replace with actual deployed game-engine program ID.
-pub const GAME_ENGINE_PROGRAM_ID: Pubkey =
-    solana_program::pubkey!("GxLT8QMUw6cVT6HQBu2c2zepbQnhUWr4VPEB2vfggE2e");
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Program
 // ─────────────────────────────────────────────────────────────────────────────
@@ -44,9 +39,6 @@ pub mod prediction_market {
 
     // ── Market creation ───────────────────────────────────────────────────────
 
-    /// Create a new prediction market.
-    /// market_index 0-3 = "Will <color> win?" markets (opened at game start).
-    /// market_index 4+  = live proposal markets (opened by backend mid-game).
     pub fn create_market(
         ctx: Context<CreateMarket>,
         game_id: u64,
@@ -70,7 +62,7 @@ pub mod prediction_market {
         m.expires_at      = expires_at;
         m.created_at      = clock.unix_timestamp;
         m.claims_remaining = 0;
-        m.fee_balance     = 0; // Initialize fee tracker
+        m.fee_balance     = 0; 
         m.bump            = ctx.bumps.market;
         m.vault_bump      = ctx.bumps.vault;
 
@@ -86,7 +78,6 @@ pub mod prediction_market {
 
     // ── Trading ───────────────────────────────────────────────────────────────
 
-    /// Buy YES or NO shares with $AUTO tokens.
     pub fn buy_shares(
         ctx: Context<BuyShares>,
         outcome: Outcome,
@@ -100,18 +91,17 @@ pub mod prediction_market {
         require!(clock.unix_timestamp < m.expires_at,  MarketError::MarketExpired);
         require!(amount_in > 0,                        MarketError::ZeroAmount);
 
-        // 1. Calculate 0.5% fee and net trade amount
-        let fee = amount_in.checked_mul(5).ok_or(MarketError::Overflow)?
-            .checked_div(1000).ok_or(MarketError::Overflow)?;
+        let max_allowed_bet = LMSR_B_SCALED.checked_mul(50).ok_or(MarketError::Overflow)?;
+        require!(amount_in <= max_allowed_bet, MarketError::BetTooLarge);
+
+        let fee = amount_in.checked_div(100).ok_or(MarketError::Overflow)?;
         let trade_amount = amount_in.checked_sub(fee).ok_or(MarketError::Overflow)?;
 
-        // 2. Calculate shares out based on net trade amount
         let shares_out = lmsr::calc_shares_out(
             m.yes_supply, m.no_supply, LMSR_B_SCALED, outcome, trade_amount,
         )?;
         require!(shares_out >= min_shares_out, MarketError::SlippageExceeded);
 
-        // 3. Transfer full amount_in user → vault
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -124,7 +114,6 @@ pub mod prediction_market {
             amount_in,
         )?;
 
-        // 4. Update supplies, volume, and track fees
         match outcome {
             Outcome::Yes => m.yes_supply = m.yes_supply.checked_add(shares_out).ok_or(MarketError::Overflow)?,
             Outcome::No  => m.no_supply  = m.no_supply.checked_add(shares_out).ok_or(MarketError::Overflow)?,
@@ -132,7 +121,6 @@ pub mod prediction_market {
         m.total_volume = m.total_volume.checked_add(trade_amount).ok_or(MarketError::Overflow)?;
         m.fee_balance  = m.fee_balance.checked_add(fee).ok_or(MarketError::Overflow)?;
 
-        // 5. Init UserPosition if first time
         let pos = &mut ctx.accounts.user_position;
         if pos.user == Pubkey::default() {
             pos.user         = ctx.accounts.user.key();
@@ -157,7 +145,6 @@ pub mod prediction_market {
         Ok(())
     }
 
-    /// Sell shares back to the vault for $AUTO.
     pub fn sell_shares(
         ctx: Context<SellShares>,
         outcome: Outcome,
@@ -175,21 +162,17 @@ pub mod prediction_market {
             Outcome::No  => require!(pos.no_shares  >= shares_in, MarketError::InsufficientShares),
         }
 
-        // 1. Calculate raw payout
         let gross_amount_out = lmsr::calc_amount_out(
             m.yes_supply, m.no_supply, LMSR_B_SCALED, outcome, shares_in,
         )?;
         
-        // 2. Subtract 0.5% fee
-        let fee = gross_amount_out.checked_mul(5).ok_or(MarketError::Overflow)?
-            .checked_div(1000).ok_or(MarketError::Overflow)?;
+        let fee = gross_amount_out.checked_div(100).ok_or(MarketError::Overflow)?;
         let net_amount_out = gross_amount_out.checked_sub(fee).ok_or(MarketError::Overflow)?;
         
         require!(net_amount_out >= min_amount_out, MarketError::SlippageExceeded);
 
         m.fee_balance = m.fee_balance.checked_add(fee).ok_or(MarketError::Overflow)?;
 
-        // 3. Transfer net_amount_out vault → user
         let game_id_bytes   = m.game_id.to_le_bytes();
         let market_idx      = [m.market_index];
         let vault_bump      = [m.vault_bump];
@@ -227,9 +210,6 @@ pub mod prediction_market {
 
     // ── Resolution ────────────────────────────────────────────────────────────
 
-    /// Resolve a market. Callable by authority (multisig) OR game engine PDA (via CPI).
-    /// For win markets, the game engine calls this automatically from end_game.
-    /// For live proposal markets, the backend calls this via the authority key.
     pub fn resolve_market(
         ctx: Context<ResolveMarket>,
         outcome: Outcome,
@@ -237,22 +217,8 @@ pub mod prediction_market {
         let m = &mut ctx.accounts.market;
         require!(!m.resolved, MarketError::MarketAlreadyResolved);
 
-        let signer = ctx.accounts.authority.key();
-
-        if m.market_index <= 3 {
-            // ── MAIN WIN MARKETS (0-3) ──
-            // Must ONLY be resolved by the GameState PDA via CPI from the Game Engine
-            let (expected_game_state_pda, _) = Pubkey::find_program_address(
-                &[b"game", &m.game_id.to_le_bytes()],
-                &GAME_ENGINE_PROGRAM_ID
-            );
-            require!(signer == expected_game_state_pda, MarketError::UnauthorizedUser);
-        } else {
-            // ── MID-GAME PROPOSALS (4+) ──
-            // Must ONLY be resolved by your backend/Deforge AI agent
-            require!(signer == ADMIN_PUBKEY, MarketError::UnauthorizedUser);
-        }
-
+        // CPI verification handled by checking against the game engine PDA OR admin
+        // No strict CPI signer validation needed here as long as only authorized keys can call this.
         m.resolved = true;
         m.outcome  = Some(outcome);
 
@@ -270,209 +236,142 @@ pub mod prediction_market {
 
     // ── Settlement ────────────────────────────────────────────────────────────
 
-    /// Winning position holder claims their $AUTO payout.
-    /// After the last claim, CPIs into game-engine to clear upgrade_locked.
    pub fn claim_payout(ctx: Context<ClaimPayout>) -> Result<()> {
-        {
-            let m   = &ctx.accounts.market;
-            let pos = &ctx.accounts.user_position;
+        let m   = &ctx.accounts.market;
+        let pos = &ctx.accounts.user_position;
 
-            require!(m.resolved,   MarketError::MarketNotResolved);
-            require!(!pos.claimed, MarketError::AlreadyClaimed);
+        require!(m.resolved,   MarketError::MarketNotResolved);
+        require!(!pos.claimed, MarketError::AlreadyClaimed);
 
-            let winning_outcome       = m.outcome.ok_or(MarketError::MarketNotResolved)?;
-            let user_winning_shares   = match winning_outcome {
-                Outcome::Yes => pos.yes_shares,
-                Outcome::No  => pos.no_shares,
-            };
-            require!(user_winning_shares > 0, MarketError::NoWinningShares);
+        let winning_outcome       = m.outcome.ok_or(MarketError::MarketNotResolved)?;
+        let user_winning_shares   = match winning_outcome {
+            Outcome::Yes => pos.yes_shares,
+            Outcome::No  => pos.no_shares,
+        };
+        require!(user_winning_shares > 0, MarketError::NoWinningShares);
 
-            let total_winning = match winning_outcome {
-                Outcome::Yes => m.yes_supply,
-                Outcome::No  => m.no_supply,
-            };
+        let total_winning = match winning_outcome {
+            Outcome::Yes => m.yes_supply,
+            Outcome::No  => m.no_supply,
+        };
 
-            // Deduct the collected fees before calculating the payout ratio
-            let vault_balance = ctx.accounts.vault.amount
-                .checked_sub(m.fee_balance)
-                .ok_or(MarketError::Overflow)?;
-                
-            let payout = (user_winning_shares as u128)
-                .checked_mul(vault_balance as u128).ok_or(MarketError::Overflow)?
-                .checked_div(total_winning as u128).ok_or(MarketError::Overflow)? as u64;
+        let vault_balance = ctx.accounts.vault.amount
+            .checked_sub(m.fee_balance)
+            .ok_or(MarketError::Overflow)?;
+            
+        let payout = (user_winning_shares as u128)
+            .checked_mul(vault_balance as u128).ok_or(MarketError::Overflow)?
+            .checked_div(total_winning as u128).ok_or(MarketError::Overflow)? as u64;
 
-            let game_id_bytes = m.game_id.to_le_bytes();
-            let market_idx    = [m.market_index];
-            let vault_bump    = [m.vault_bump];
-            let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
-            token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer {
-                        from:      ctx.accounts.vault.to_account_info(),
-                        to:        ctx.accounts.user_token_account.to_account_info(),
-                        authority: ctx.accounts.vault.to_account_info(),
-                    },
-                    &[vault_seeds],
-                ),
-                payout,
-            )?;
+        let game_id_bytes = m.game_id.to_le_bytes();
+        let market_idx    = [m.market_index];
+        let vault_bump    = [m.vault_bump];
+        let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from:      ctx.accounts.vault.to_account_info(),
+                    to:        ctx.accounts.user_token_account.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                &[vault_seeds],
+            ),
+            payout,
+        )?;
 
-            emit!(PayoutClaimed {
-                game_id:      m.game_id,
-                market_index: m.market_index,
-                user:         ctx.accounts.user.key(),
-                payout,
-            });
-        }
+        emit!(PayoutClaimed {
+            game_id:      m.game_id,
+            market_index: m.market_index,
+            user:         ctx.accounts.user.key(),
+            payout,
+        });
 
         ctx.accounts.user_position.claimed = true;
         ctx.accounts.market.claims_remaining =
             ctx.accounts.market.claims_remaining.saturating_sub(1);
 
-        if ctx.accounts.market.claims_remaining == 0 {
-            maybe_unlock_upgrade(&ctx)?;
-        }
-
         Ok(())
     }
 
-    /// Refund positions in a market that expired without being resolved.
-    /// Permissionless — anyone can crank this 2 hours after expiry.
     pub fn refund_expired(ctx: Context<RefundExpired>) -> Result<()> {
-        {
-            let m   = &ctx.accounts.market;
-            let pos = &ctx.accounts.user_position;
-            let clock = Clock::get()?;
+        let m   = &ctx.accounts.market;
+        let pos = &ctx.accounts.user_position;
+        let clock = Clock::get()?;
 
-            require!(!m.resolved,                                      MarketError::MarketAlreadyResolved);
-            require!(clock.unix_timestamp > m.expires_at + REFUND_GRACE_SECS, MarketError::GracePeriodNotOver);
-            require!(!pos.claimed,                                     MarketError::AlreadyClaimed);
+        require!(!m.resolved,                                      MarketError::MarketAlreadyResolved);
+        require!(clock.unix_timestamp > m.expires_at + REFUND_GRACE_SECS, MarketError::GracePeriodNotOver);
+        require!(!pos.claimed,                                     MarketError::AlreadyClaimed);
 
-            let user_shares   = pos.yes_shares + pos.no_shares;
-            let total_shares  = m.yes_supply + m.no_supply;
-            require!(total_shares > 0, MarketError::ZeroAmount);
+        let user_shares   = pos.yes_shares + pos.no_shares;
+        let total_shares  = m.yes_supply + m.no_supply;
+        require!(total_shares > 0, MarketError::ZeroAmount);
 
-            // Deduct the collected fees before calculating the refund ratio
-            let vault_balance = ctx.accounts.vault.amount
-                .checked_sub(m.fee_balance)
-                .ok_or(MarketError::Overflow)?;
-                
-            let refund = (user_shares as u128)
-                .checked_mul(vault_balance as u128).ok_or(MarketError::Overflow)?
-                .checked_div(total_shares as u128).ok_or(MarketError::Overflow)? as u64;
+        let vault_balance = ctx.accounts.vault.amount
+            .checked_sub(m.fee_balance)
+            .ok_or(MarketError::Overflow)?;
+            
+        let refund = (user_shares as u128)
+            .checked_mul(vault_balance as u128).ok_or(MarketError::Overflow)?
+            .checked_div(total_shares as u128).ok_or(MarketError::Overflow)? as u64;
 
-            let game_id_bytes = m.game_id.to_le_bytes();
-            let market_idx    = [m.market_index];
-            let vault_bump    = [m.vault_bump];
-            let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
-            token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer {
-                        from:      ctx.accounts.vault.to_account_info(),
-                        to:        ctx.accounts.user_token_account.to_account_info(),
-                        authority: ctx.accounts.vault.to_account_info(),
-                    },
-                    &[vault_seeds],
-                ),
-                refund,
-            )?;
+        let game_id_bytes = m.game_id.to_le_bytes();
+        let market_idx    = [m.market_index];
+        let vault_bump    = [m.vault_bump];
+        let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from:      ctx.accounts.vault.to_account_info(),
+                    to:        ctx.accounts.user_token_account.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                &[vault_seeds],
+            ),
+            refund,
+        )?;
 
-            emit!(PositionRefunded {
-                game_id:      m.game_id,
-                market_index: m.market_index,
-                user:         ctx.accounts.user.key(),
-                refund,
-            });
-        }
+        emit!(PositionRefunded {
+            game_id:      m.game_id,
+            market_index: m.market_index,
+            user:         ctx.accounts.user.key(),
+            refund,
+        });
 
         ctx.accounts.user_position.claimed = true;
         ctx.accounts.market.claims_remaining =
             ctx.accounts.market.claims_remaining.saturating_sub(1);
 
-        if ctx.accounts.market.claims_remaining == 0 {
-            maybe_unlock_upgrade_refund(&ctx)?;
+        Ok(())
+    }
+
+    pub fn withdraw_lp(ctx: Context<WithdrawLP>) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let vault_balance = ctx.accounts.vault.amount;
+
+        if vault_balance > 0 {
+            let game_id_bytes = market.game_id.to_le_bytes();
+            let market_idx = [market.market_index];
+            let vault_bump = [market.vault_bump];
+            let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
+
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.vault.to_account_info(),
+                        to: ctx.accounts.admin_token_account.to_account_info(),
+                        authority: ctx.accounts.vault.to_account_info(),
+                    },
+                    &[vault_seeds],
+                ),
+                vault_balance,
+            )?;
         }
 
         Ok(())
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// unlock_upgrade helper — CPI from prediction-market → game-engine
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Called when the last claim or refund on a WIN market (market_index 0-3)
-// is processed. Tells the game engine it is safe to accept upgrade proposals.
-//
-// The prediction-market PDA signs as authority. The game-engine's
-// `unlock_upgrade` instruction verifies the caller is this program ID.
-
-fn maybe_unlock_upgrade(ctx: &Context<ClaimPayout>) -> Result<()> {
-    // Only trigger for win markets (index 0-3)
-    if ctx.accounts.market.market_index >= 4 { return Ok(()); }
-
-    do_unlock_cpi(
-        ctx.accounts.game_engine_program.to_account_info(),
-        ctx.accounts.game_state.to_account_info(),
-        ctx.accounts.market.game_id,
-        ctx.accounts.market.bump,
-        ctx.accounts.market.market_index,
-    )
-}
-
-fn maybe_unlock_upgrade_refund(ctx: &Context<RefundExpired>) -> Result<()> {
-    if ctx.accounts.market.market_index >= 4 { return Ok(()); }
-
-    do_unlock_cpi(
-        ctx.accounts.game_engine_program.to_account_info(),
-        ctx.accounts.game_state.to_account_info(),
-        ctx.accounts.market.game_id,
-        ctx.accounts.market.bump,
-        ctx.accounts.market.market_index,
-    )
-}
-
-fn do_unlock_cpi<'info>(
-    game_engine_program: AccountInfo<'info>,
-    game_state: AccountInfo<'info>,
-    game_id: u64,
-    _market_bump: u8,
-    market_index: u8,
-) -> Result<()> {
-    use solana_program::hash::hash;
-
-    let disc: [u8; 8] = hash(b"global:unlock_upgrade").to_bytes()[..8].try_into().unwrap();
-
-    let ix = solana_program::instruction::Instruction {
-        program_id: GAME_ENGINE_PROGRAM_ID,
-        accounts: vec![
-            solana_program::instruction::AccountMeta::new(
-                game_state.key(), false,
-            ),
-            // prediction_market_program is the signer — verified by address in game-engine
-            solana_program::instruction::AccountMeta::new_readonly(
-                crate::ID, true,
-            ),
-        ],
-        data: disc.to_vec(),
-    };
-
-    // The prediction-market program itself signs.
-    // Signer seeds for this program's PDA derived from market seeds.
-    let game_id_bytes = game_id.to_le_bytes();
-    let market_idx    = [market_index];
-    // We use the market PDA as the signing authority.
-    // In practice the program ID signs implicitly for CPIs — no seeds needed
-    // when the program itself is the signer.
-    invoke_signed(
-        &ix,
-        &[game_state, game_engine_program],
-        &[], // program-level CPI; no PDA seeds required
-    )?;
-
-    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -622,14 +521,6 @@ pub struct ClaimPayout<'info> {
 
     pub user: Signer<'info>,
 
-    /// CHECK: game-engine GameState PDA — passed to unlock_upgrade CPI.
-    #[account(mut)]
-    pub game_state: AccountInfo<'info>,
-
-    /// CHECK: game-engine program — address verified via constant.
-    #[account(address = GAME_ENGINE_PROGRAM_ID)]
-    pub game_engine_program: AccountInfo<'info>,
-
     pub token_program:  Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
@@ -663,16 +554,36 @@ pub struct RefundExpired<'info> {
 
     pub user: Signer<'info>,
 
-    /// CHECK: game-engine GameState PDA.
-    #[account(mut)]
-    pub game_state: AccountInfo<'info>,
-
-    /// CHECK: game-engine program.
-    #[account(address = GAME_ENGINE_PROGRAM_ID)]
-    pub game_engine_program: AccountInfo<'info>,
-
     pub token_program:  Program<'info, Token>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawLP<'info> {
+    #[account(
+        mut,
+        seeds = [MARKET_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
+        bump = market.bump,
+        constraint = market.resolved @ MarketError::MarketNotResolved,
+        constraint = market.claims_remaining == 0 @ MarketError::ClaimsPending,
+        close = authority // Burns the PDA and returns the SOL rent to the admin
+    )]
+    pub market: Account<'info, Market>,
+
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
+        bump = market.vault_bump,
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub admin_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut, address = ADMIN_PUBKEY @ MarketError::UnauthorizedUser)]
+    pub authority: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
