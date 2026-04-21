@@ -1,7 +1,8 @@
 import * as anchor from "@coral-xyz/anchor";
-const { BN, web3 } = anchor;
-import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
-import { createMint, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import BN from "bn.js";
+import { Keypair, PublicKey, SystemProgram, ComputeBudgetProgram } from "@solana/web3.js";
+import { getOrCreateAssociatedTokenAccount, TOKEN_PROGRAM_ID, mintTo, createMint } from "@solana/spl-token";
+import * as sb from "@switchboard-xyz/on-demand";
 
 // --- Helpers ---
 function gameIdBuf(id: number): Buffer {
@@ -14,7 +15,6 @@ function u8Buf(v: number): Buffer {
 }
 
 async function main() {
-  // Set up the provider (uses your Anchor.toml settings: devnet + local wallet)
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
@@ -22,119 +22,127 @@ async function main() {
   const predMarket = anchor.workspace.PredictionMarket as any;
   const authority = (provider.wallet as anchor.Wallet).payer;
 
-  console.log("🚀 Starting Devnet Prototype Agent...");
+  console.log("\n====================================================");
+  console.log("🚀 AUTO-BATTLE ARENA: SCALING DEATHMATCH");
+  console.log("====================================================");
   console.log(`🔑 Wallet: ${authority.publicKey.toBase58()}`);
 
-  // 1. Check or Initialize Registry
-  const [registryPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("registry")],
-    gameEngine.programId
-  );
-
-  let registry;
+  // PHASE 1: INIT GAME
+  const [registryPda] = PublicKey.findProgramAddressSync([Buffer.from("registry")], gameEngine.programId);
+  let nextGameId = 1;
   try {
-    registry = await gameEngine.account.registry.fetch(registryPda);
-    console.log(`✅ Registry found. Current Game Count: ${registry.gameCount.toNumber()}`);
-  } catch (e) {
-    console.log("⚙️ Registry not found. Initializing now...");
-    await gameEngine.methods
-      .initializeRegistry(new BN(300)) // 5 minute cooldown
-      .accounts({
-        registry: registryPda,
-        authority: authority.publicKey,
-        systemProgram: SystemProgram.programId,
-      })
-      .rpc();
-    registry = await gameEngine.account.registry.fetch(registryPda);
-    console.log("✅ Registry Initialized!");
-  }
+    const reg = await gameEngine.account.registry.fetch(registryPda);
+    nextGameId = reg.gameCount.toNumber() + 1;
+  } catch (e) {}
 
-  // 2. Start a New Game
-  const nextGameId = registry.gameCount.toNumber() + 1;
-  const [gamePda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("game"), gameIdBuf(nextGameId)],
-    gameEngine.programId
-  );
+  const [gamePda] = PublicKey.findProgramAddressSync([Buffer.from("game"), gameIdBuf(nextGameId)], gameEngine.programId);
+  const [vrfRequestPda] = PublicKey.findProgramAddressSync([Buffer.from("vrf_request"), gameIdBuf(nextGameId)], gameEngine.programId);
 
-  // Generate random keys for the 4 AI agents for testing
-  const agents = [Keypair.generate(), Keypair.generate(), Keypair.generate(), Keypair.generate()];
-
-  console.log(`🎲 Starting Game ID: ${nextGameId}...`);
-  
-  // Note: If gameCount > 0, we need to pass the PREVIOUS game PDA as a remaining account
-  // to satisfy the cooldown check.
-  const remainingAccounts = [];
-  if (registry.gameCount.toNumber() > 0) {
-    const [prevGamePda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("game"), gameIdBuf(registry.gameCount.toNumber())],
-      gameEngine.programId
-    );
-    remainingAccounts.push({ pubkey: prevGamePda, isWritable: false, isSigner: false });
-  }
-
-  await gameEngine.methods
-    .initGame(agents[0].publicKey, agents[1].publicKey, agents[2].publicKey, agents[3].publicKey)
-    .accounts({
-      registry: registryPda,
-      gameState: gamePda,
-      crank: authority.publicKey,
-      systemProgram: SystemProgram.programId,
-    })
-    .remainingAccounts(remainingAccounts)
+  console.log(`\n[SYSTEM] Initializing Game #${nextGameId}...`);
+  await gameEngine.methods.initGame(authority.publicKey, authority.publicKey)
+    .accounts({ registry: registryPda, gameState: gamePda, crank: authority.publicKey, systemProgram: SystemProgram.programId })
     .rpc();
+  console.log(`✅ Game State Created at ${gamePda.toBase58().slice(0, 8)}...`);
 
-  console.log(`✅ Game ${nextGameId} Initialized! PDA: ${gamePda.toBase58()}`);
+  // PHASE 2: INIT MARKET
+  console.log(`[MARKET] Setting up Prediction Market & $AUTO Mint...`);
+  const [marketPda] = PublicKey.findProgramAddressSync([Buffer.from("market"), gameIdBuf(nextGameId), u8Buf(0)], predMarket.programId);
+  const [vaultPda] = PublicKey.findProgramAddressSync([Buffer.from("vault"), gameIdBuf(nextGameId), u8Buf(0)], predMarket.programId);
+  const dummyMint = await createMint(provider.connection, authority, authority.publicKey, null, 6);
+  
+  await predMarket.methods.createMarket(new BN(nextGameId), 0, "Red Win?", new BN(Math.floor(Date.now()/1000)+86400))
+    .accounts({ market: marketPda, vault: vaultPda, autoMint: dummyMint, authority: authority.publicKey, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId, rent: anchor.web3.SYSVAR_RENT_PUBKEY })
+    .rpc();
+  console.log(`✅ Market Live: "Will Red Win?"`);
 
-  // 3. Create a Dummy Token Mint (For testing market liquidity on Devnet)
-  console.log("🪙 Minting Dummy $AUTO Token for markets...");
-  const dummyMint = await createMint(
-    provider.connection,
-    authority,
-    authority.publicKey,
-    null,
-    6 // 6 decimals like pump.fun
-  );
-  console.log(`✅ Dummy Mint Created: ${dummyMint.toBase58()}`);
+  // VRF HELPER
+  const sbProgramId = new PublicKey("Aio4gaXjXzJNVLtzwtNVmSqGKpANtXhybbkhtAC94ji2");
+  const sbIdl = await anchor.Program.fetchIdl(sbProgramId, provider);
+  const sbProgram = new anchor.Program(sbIdl!, provider) as any;
+  const queue = await sb.getDefaultQueue(provider.connection.rpcEndpoint);
 
-  // 4. Bundle and Create the 4 Default Markets
-  console.log("📊 Bundling 4 Prediction Markets into one transaction...");
-  const tx = new web3.Transaction();
-  const colors = ["Red", "Blue", "Yellow", "Green"];
-  const expiresAt = Math.floor(Date.now() / 1000) + 86400; // 24 hours from now
-
-  for (let i = 0; i < 4; i++) {
-    const [marketPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("market"), gameIdBuf(nextGameId), u8Buf(i)],
-      predMarket.programId
-    );
-    const [vaultPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("vault"), gameIdBuf(nextGameId), u8Buf(i)],
-      predMarket.programId
-    );
-
-    const ix = await predMarket.methods
-      .createMarket(new BN(nextGameId), i, `Will ${colors[i]} win?`, new BN(expiresAt))
-      .accounts({
-        market: marketPda,
-        vault: vaultPda,
-        autoMint: dummyMint,
-        authority: authority.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-      })
-      .instruction(); // <-- Notice we use .instruction() instead of .rpc() to bundle them!
-
-    tx.add(ix);
+  async function executeVrfPhase(rollType: number, phaseName: string) {
+    process.stdout.write(`   🎲 ${phaseName} | Requesting VRF... `);
+    const rngKp = Keypair.generate();
+    const [randomness, createIx] = await sb.Randomness.create(sbProgram, rngKp, queue.pubkey);
+    await provider.sendAndConfirm(new anchor.web3.Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 500_000 }), createIx), [rngKp]);
+    
+    const commitIx = await randomness.commitIx(queue.pubkey);
+    const requestRollIx = await gameEngine.methods.requestVrf(rollType).accounts({ gameState: gamePda, vrfRequest: vrfRequestPda, randomnessAccount: rngKp.publicKey, agent: authority.publicKey, systemProgram: SystemProgram.programId }).instruction();
+    await provider.sendAndConfirm(new anchor.web3.Transaction().add(commitIx, requestRollIx));
+    
+    process.stdout.write(`Oracle working... `);
+    await new Promise((r) => setTimeout(r, 3000));
+    
+    const revealIx = await randomness.revealIx();
+    const fulfillRollIx = await gameEngine.methods.fulfillVrf().accounts({ gameState: gamePda, vrfRequest: vrfRequestPda, randomnessAccount: rngKp.publicKey, crank: authority.publicKey, systemProgram: SystemProgram.programId }).instruction();
+    await provider.sendAndConfirm(new anchor.web3.Transaction().add(revealIx, fulfillRollIx));
+    
+    const gs = await gameEngine.account.gameState.fetch(gamePda);
+    console.log(`Done! -> [Score: R ${gs.p1Score} | B ${gs.p2Score}]`);
   }
 
-  // Send the bundled transaction
-  const txSig = await provider.sendAndConfirm(tx);
-  console.log(`✅ All 4 Markets successfully created!`);
-  console.log(`🔗 Transaction Signature: https://explorer.solana.com/tx/${txSig}?cluster=devnet`);
-  console.log("🎉 Run complete. Devnet is fully populated and ready for UI testing.");
+  // MATCH LOOP
+  let matchOver = false;
+  let round = 1;
+
+  while (!matchOver) {
+    const damagePower = 1 << (round - 1);
+    console.log(`\n--- ROUND ${round} | STAKES: ${damagePower} HP ---`);
+    
+    // 1. Initial Deal
+    await executeVrfPhase(0, "DEAL");
+
+    // 2. Turns (Simulation: Both hit once)
+    console.log(`   🏃 RED Move: HIT`);
+    await executeVrfPhase(1, "HIT (Red)");
+    
+    console.log(`   🏃 BLUE Move: HIT`);
+    await executeVrfPhase(1, "HIT (Blue)");
+    
+    // 3. Stays
+    console.log(`   ✋ Action: BOTH STAY`);
+    await gameEngine.methods.stay({ red: {} }).accounts({ gameState: gamePda, agent: authority.publicKey }).rpc();
+    await gameEngine.methods.stay({ blue: {} }).accounts({ gameState: gamePda, agent: authority.publicKey }).rpc();
+    
+    // 4. Final Reveal
+    await executeVrfPhase(2, "THE RIVER (Final Reveal)");
+
+    const gs = await gameEngine.account.gameState.fetch(gamePda);
+    console.log(`\n   📊 FINAL HAND: [Red: ${gs.p1Score}] vs [Blue: ${gs.p2Score}]`);
+
+    // 5. Resolve
+    process.stdout.write(`   ⚔️  Resolving Damage... `);
+    try {
+      await gameEngine.methods.resolveRound()
+        .accounts({ registry: registryPda, gameState: gamePda, crank: authority.publicKey })
+        .remainingAccounts([{ pubkey: marketPda, isWritable: true, isSigner: false }, { pubkey: predMarket.programId, isWritable: false, isSigner: false }])
+        .rpc();
+      console.log(`Calculated!`);
+    } catch (e: any) {
+        if (e.logs?.some((l: string) => l.includes("MarketAlreadyResolved"))) {
+            console.log(`Market Settled!`);
+        } else {
+            console.log(`Error or Tie Detected.`);
+        }
+    }
+
+    const finalGs = await gameEngine.account.gameState.fetch(gamePda);
+    console.log(`   ❤️  RED HP: ${finalGs.p1Hp}/10`);
+    console.log(`   💙  BLUE HP: ${finalGs.p2Hp}/10`);
+
+    if (finalGs.p1Hp === 0 || finalGs.p2Hp === 0) {
+      const winner = finalGs.p1Hp === 0 ? "BLUE" : "RED";
+      console.log(`\n====================================================`);
+      console.log(`🏆 MATCH OVER! WINNER: ${winner}`);
+      console.log(`💰 Prediction Market Payouts Unlocked.`);
+      console.log(`====================================================\n`);
+      matchOver = true;
+    } else {
+      console.log(`\n[SYSTEM] No fatal blow. Scaling stakes...`);
+      round++;
+    }
+  }
 }
 
-main().catch((err) => {
-  console.error("❌ Script Error:", err);
-});
+main().catch(console.error);

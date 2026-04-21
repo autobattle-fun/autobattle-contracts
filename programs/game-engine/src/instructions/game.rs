@@ -308,20 +308,25 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
     let p1_diff = gs.p1_score.abs_diff(21);
     let p2_diff = gs.p2_score.abs_diff(21);
 
+    // Rule 5: Tiebreaker Logic
     if p1_diff == p2_diff {
+        msg!("Tie detected! Entering Sudden Death.");
         gs.phase = GamePhase::AwaitingTiebreakerVRF;
         return Ok(()); 
     }
 
+    // Rule 4: Damage Scaling (1, 2, 4, 8...)
     let damage = 1 << (gs.round_number.saturating_sub(1));
     let mut round_winner = None;
 
     if p1_diff < p2_diff {
         gs.p2_hp = gs.p2_hp.saturating_sub(damage);
         round_winner = Some(Color::Red);
-    } else if p2_diff < p1_diff {
+        msg!("Red wins round! Dealt {} damage.", damage);
+    } else {
         gs.p1_hp = gs.p1_hp.saturating_sub(damage);
         round_winner = Some(Color::Blue);
+        msg!("Blue wins round! Dealt {} damage.", damage);
     } 
 
     emit!(RoundResolved {
@@ -329,13 +334,10 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
         round_number: gs.round_number,
         p1_hp: gs.p1_hp,
         p2_hp: gs.p2_hp,
-        damage_dealt: if round_winner.is_some() { damage } else { 0 },
+        damage_dealt: damage,
     });
 
-    if let Some(winner) = round_winner {
-        resolve_market_cpi(gs, &ctx.remaining_accounts[0], winner)?;
-    }
-
+    // Check for Game Over FIRST to avoid double CPI calls
     if gs.p1_hp == 0 || gs.p2_hp == 0 {
         gs.phase = GamePhase::Ended;
         gs.winner = if gs.p1_hp > 0 { Some(Color::Red) } else { Some(Color::Blue) };
@@ -349,8 +351,12 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
             ended_at: Clock::get()?.unix_timestamp,
         });
 
-        resolve_market_cpi(gs, &ctx.remaining_accounts[1], gs.winner.unwrap())?;
+        // ONLY resolve the market once at the very end of the match
+        if let Some(market_info) = ctx.remaining_accounts.get(0) {
+            resolve_market_cpi(gs, market_info, gs.winner.unwrap())?;
+        }
     } else {
+        // Match continues: Reset for next round
         gs.p1_score = 0;
         gs.p2_score = 0;
         gs.p1_aces = 0;
@@ -359,6 +365,10 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
         gs.p2_stayed = false;
         gs.round_number += 1;
         gs.phase = GamePhase::AwaitingInitialDeal;
+        
+        // If it's just a round end (not game end), we don't necessarily 
+        // need to call the prediction market unless you want to settle 
+        // "Round winner" bets specifically.
     }
     Ok(())
 }
