@@ -209,8 +209,8 @@ pub fn fulfill_vrf(ctx: Context<FulfillRoll>) -> Result<()> {
 
     if ctx.accounts.vrf_request.roll_type == 0 {
         // Now Rust allows the disjoint borrows perfectly
-        apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
-        apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
+        inner.p1_last_card = apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
+        inner.p2_last_card = apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
         inner.phase = GamePhase::AwaitingAction;
 
         emit!(CardsDealt {
@@ -222,10 +222,10 @@ pub fn fulfill_vrf(ctx: Context<FulfillRoll>) -> Result<()> {
 
     } else if ctx.accounts.vrf_request.roll_type == 1 {
         if inner.active_player == Color::Red {
-            apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
+            inner.p1_last_card = apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
             if inner.p1_score >= 21 { inner.p1_stayed = true; }
         } else {
-            apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[0]);
+            inner.p2_last_card = apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[0]);
             if inner.p2_score >= 21 { inner.p2_stayed = true; }
         }
         
@@ -248,8 +248,8 @@ pub fn fulfill_vrf(ctx: Context<FulfillRoll>) -> Result<()> {
         };
 
     } else if ctx.accounts.vrf_request.roll_type == 2 {
-        apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
-        apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
+        inner.p1_last_card = apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
+        inner.p2_last_card = apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
         
         inner.phase = GamePhase::ReadyToResolve;
 
@@ -261,8 +261,8 @@ pub fn fulfill_vrf(ctx: Context<FulfillRoll>) -> Result<()> {
         });
     } else if ctx.accounts.vrf_request.roll_type == 3 {
         // NEW: Tiebreaker logic
-        apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
-        apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
+        inner.p1_last_card = apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
+        inner.p2_last_card = apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
         
         inner.phase = GamePhase::ReadyToResolve;
 
@@ -315,32 +315,29 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
         return Ok(()); 
     }
 
-    // Rule 4: Damage Scaling (1, 2, 4, 8...)
     let damage = 1 << (gs.round_number.saturating_sub(1));
-    let mut round_winner = None;
-
-    if p1_diff < p2_diff {
+    
+    // Determine the round winner
+    let round_winner = if p1_diff < p2_diff {
         gs.p2_hp = gs.p2_hp.saturating_sub(damage);
-        round_winner = Some(Color::Red);
         msg!("Red wins round! Dealt {} damage.", damage);
+        Color::Red
     } else {
         gs.p1_hp = gs.p1_hp.saturating_sub(damage);
-        round_winner = Some(Color::Blue);
         msg!("Blue wins round! Dealt {} damage.", damage);
-    } 
+        Color::Blue
+    };
 
-    emit!(RoundResolved {
-        game_id: gs.game_id,
-        round_number: gs.round_number,
-        p1_hp: gs.p1_hp,
-        p2_hp: gs.p2_hp,
-        damage_dealt: damage,
-    });
+    // --- 1. RESOLVE THE ROUND MARKET ---
+    if let Some(round_market_info) = ctx.remaining_accounts.get(0) {
+        // Resolve the micro-market for THIS specific round
+        resolve_market_cpi(gs, round_market_info, round_winner)?;
+    }
 
-    // Check for Game Over FIRST to avoid double CPI calls
+    // Check for Game Over
     if gs.p1_hp == 0 || gs.p2_hp == 0 {
         gs.phase = GamePhase::Ended;
-        gs.winner = if gs.p1_hp > 0 { Some(Color::Red) } else { Some(Color::Blue) };
+        gs.winner = Some(round_winner);
         ctx.accounts.registry.game_active = false;
 
         emit!(GameEnded {
@@ -351,9 +348,10 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
             ended_at: Clock::get()?.unix_timestamp,
         });
 
-        // ONLY resolve the market once at the very end of the match
-        if let Some(market_info) = ctx.remaining_accounts.get(0) {
-            resolve_market_cpi(gs, market_info, gs.winner.unwrap())?;
+        // --- 2. RESOLVE THE MAIN MARKET ---
+        if let Some(main_market_info) = ctx.remaining_accounts.get(1) {
+            // Resolve the overall match winner market
+            resolve_market_cpi(gs, main_market_info, gs.winner.unwrap())?;
         }
     } else {
         // Match continues: Reset for next round
@@ -365,10 +363,6 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
         gs.p2_stayed = false;
         gs.round_number += 1;
         gs.phase = GamePhase::AwaitingInitialDeal;
-        
-        // If it's just a round end (not game end), we don't necessarily 
-        // need to call the prediction market unless you want to settle 
-        // "Round winner" bets specifically.
     }
     Ok(())
 }
@@ -439,7 +433,8 @@ pub fn unlock_upgrade(ctx: Context<UnlockUpgrade>) -> Result<()> {
 //     Ok(())
 // }
 
-fn apply_card(score: &mut u8, aces: &mut u8, random_byte: u8) {
+// Notice the `-> u8` at the end!
+fn apply_card(score: &mut u8, aces: &mut u8, random_byte: u8) -> u8 {
     let raw = (random_byte % 13) + 1;
     let mut value = if raw > 10 { 10 } else { raw };
     
@@ -454,6 +449,8 @@ fn apply_card(score: &mut u8, aces: &mut u8, random_byte: u8) {
         *score -= 10;
         *aces -= 1;
     }
+    
+    raw // Return the actual card face (1 = Ace, 11 = Jack, 13 = King, etc.)
 }
 
 fn resolve_market_cpi<'info>(

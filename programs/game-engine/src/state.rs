@@ -40,6 +40,8 @@ pub struct GameState {
     pub p2_hp: u8,
     pub p1_score: u8,
     pub p2_score: u8,
+    pub p1_last_card: u8,
+    pub p2_last_card: u8,
     pub p1_aces: u8,
     pub p2_aces: u8,
     pub p1_stayed: bool,
@@ -55,7 +57,7 @@ pub struct GameState {
 }
 
 impl GameState {
-    pub const LEN: usize = 8 + 8 + 32 + 32 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 8 + 8 + 1 + 1 + 32;
+    pub const LEN: usize = 8 + 8 + 32 + 32 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 8 + 8 + 1 + 1;
 
     pub fn agent_for(&self, color: Color) -> Pubkey {
         match color {
