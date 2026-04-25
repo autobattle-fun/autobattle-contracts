@@ -520,7 +520,6 @@ pub struct ResolveMarket<'info> {
     pub market: Account<'info, Market>,
 
     #[account(
-        mut,
         constraint = {
             let (game_pda, _) = Pubkey::find_program_address(
                 &[b"game", &market.game_id.to_le_bytes()],

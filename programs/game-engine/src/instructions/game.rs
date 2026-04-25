@@ -346,7 +346,8 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
     // Verify the round market PDA before resolving to prevent a malicious caller
     // from passing an arbitrary account.
     if let Some(round_market_info) = ctx.remaining_accounts.get(0) {
-        let market_index: u8 = gs.round_number.saturating_sub(1);
+        let market_index: u8 = gs.round_number; 
+        
         let (expected_pda, _) = Pubkey::find_program_address(
             &[MARKET_SEED, &gs.game_id.to_le_bytes(), &[market_index]],
             &PREDICTION_MARKET_PROGRAM_ID,
@@ -371,7 +372,8 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
         // Verify the main (match-winner) market PDA before resolving.
         if let Some(main_market_info) = ctx.remaining_accounts.get(1) {
             let (expected_pda, _) = Pubkey::find_program_address(
-                &[MARKET_SEED, &gs.game_id.to_le_bytes(), &[255u8]], // index 255 = match winner market
+                // FIX: Use Index 0 for the Main Market
+                &[MARKET_SEED, &gs.game_id.to_le_bytes(), &[0u8]], 
                 &PREDICTION_MARKET_PROGRAM_ID,
             );
             require!(main_market_info.key() == expected_pda, GameError::InvalidMarketAccount);
