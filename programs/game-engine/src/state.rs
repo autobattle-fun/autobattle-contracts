@@ -6,7 +6,7 @@ pub enum Color {
     Blue = 1,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GamePhase {
     AwaitingInitialDeal,
     AwaitingHitVRF,
@@ -57,7 +57,7 @@ pub struct GameState {
 }
 
 impl GameState {
-    pub const LEN: usize = 8 + 8 + 32 + 32 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 8 + 8 + 1 + 1;
+    pub const LEN: usize = 8 + 8 + 32 + 32 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 8 + 8 + 1 + 1 + 32;
 
     pub fn agent_for(&self, color: Color) -> Pubkey {
         match color {

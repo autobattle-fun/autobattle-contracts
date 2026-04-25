@@ -40,4 +40,10 @@ pub enum GameError {
     InvalidPrevGameState,
     #[msg("Game ID does not match registry current_game_id")]
     InvalidGameId,
+    #[msg("Account is not a valid Switchboard randomness account")]
+    InvalidRandomnessAccount,
+    #[msg("Provided market account does not match the expected PDA")]
+    InvalidMarketAccount,
+    #[msg("Signer is not the authorized crank for this operation")]
+    UnauthorizedCrank,
 }

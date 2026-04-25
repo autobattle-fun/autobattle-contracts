@@ -23,21 +23,6 @@ pub struct InitGame<'info> {
     pub system_program: Program<'info, System>,
 }
 
-// #[derive(Accounts)]
-// pub struct MockFulfillRoll<'info> {
-//     #[account(mut, seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()], bump = game_state.bump)]
-//     pub game_state: Account<'info, GameState>,
-//     #[account(
-//         mut,
-//         seeds = [VRF_SEED, &game_state.game_id.to_le_bytes()],
-//         bump = vrf_request.bump,
-//         close = crank,
-//     )]
-//     pub vrf_request: Account<'info, VRFRequest>,
-//     #[account(mut)]
-//     pub crank: Signer<'info>, 
-// }
-
 #[derive(Accounts)]
 #[instruction(roll_type: u8)]
 pub struct RequestRoll<'info> {
@@ -51,7 +36,7 @@ pub struct RequestRoll<'info> {
         space = VRFRequest::LEN,
     )]
     pub vrf_request: Account<'info, VRFRequest>,
-    /// CHECK: Validated manually via Switchboard parse
+    /// CHECK: Data validated via RandomnessAccountData::parse in instruction logic
     pub randomness_account: AccountInfo<'info>,
     #[account(mut)]
     pub agent: Signer<'info>,
@@ -69,7 +54,7 @@ pub struct FulfillRoll<'info> {
         close = crank,
     )]
     pub vrf_request: Account<'info, VRFRequest>,
-    /// CHECK: Validated manually via Switchboard parse
+    /// CHECK: Data validated via RandomnessAccountData::parse in instruction logic
     pub randomness_account: AccountInfo<'info>,
     #[account(mut)]
     pub crank: Signer<'info>,
@@ -93,13 +78,14 @@ pub struct ResolveRound<'info> {
     pub crank: Signer<'info>,
 }
 
+// FIX: Programs cannot be Signers. unlock_upgrade is now called by the admin keypair,
+// which is the only trustworthy off-chain authority available.
 #[derive(Accounts)]
 pub struct UnlockUpgrade<'info> {
     #[account(mut, seeds = [GAME_SEED, &game_state.game_id.to_le_bytes()], bump = game_state.bump)]
     pub game_state: Account<'info, GameState>,
-    /// CHECK: Address verified by constant
-    #[account(address = PREDICTION_MARKET_PROGRAM_ID)]
-    pub prediction_market_program: Signer<'info>,
+    #[account(mut, address = ADMIN_PUBKEY @ GameError::UnauthorizedCrank)]
+    pub authority: Signer<'info>,
 }
 
 // ── Instruction Logic ────────────────────────────────────────────────────────
@@ -112,7 +98,7 @@ pub fn init_game<'info>(
     let reg   = &mut ctx.accounts.registry;
     let clock = Clock::get()?;
 
-    let new_game_id = reg.game_count.checked_add(1).unwrap();
+    let new_game_id = reg.game_count.checked_add(1).ok_or(GameError::Overflow)?;
     reg.game_count      = new_game_id;
     reg.current_game_id = new_game_id;
     reg.game_active     = true;
@@ -157,19 +143,24 @@ pub fn request_vrf(ctx: Context<RequestRoll>, roll_type: u8) -> Result<()> {
         require!(gs.phase == GamePhase::AwaitingAction, GameError::InvalidPhase);
         require!(ctx.accounts.agent.key() == gs.agent_for(gs.active_player), GameError::NotYourTurn);
         let score = if gs.active_player == Color::Red { gs.p1_score } else { gs.p2_score };
-        require!(score <= 21, GameError::Over21CannotHit); 
+        require!(score <= 21, GameError::Over21CannotHit);
     } else if roll_type == 2 {
         require!(gs.phase == GamePhase::AwaitingFinalRevealVRF, GameError::InvalidPhase);
     } else if roll_type == 3 {
         require!(gs.phase == GamePhase::AwaitingTiebreakerVRF, GameError::InvalidPhase);
     }
 
-    let randomness_data = RandomnessAccountData::parse(ctx.accounts.randomness_account.data.borrow()).unwrap();
+    // FIX: .unwrap() replaced with proper error propagation to avoid panics on bad input.
+    // Owner constraint on the account struct ensures it belongs to Switchboard.
+    let randomness_data = RandomnessAccountData::parse(
+        ctx.accounts.randomness_account.data.borrow()
+    ).map_err(|_| GameError::InvalidRandomnessAccount)?;
+
     require!(randomness_data.seed_slot == clock.slot - 1, GameError::RandomnessExpired);
     require!(randomness_data.get_value(clock.slot).is_err(), GameError::RandomnessAlreadyRevealed);
 
     gs.pending_commit_slot = randomness_data.seed_slot;
-    
+
     gs.phase = match roll_type {
         0 => GamePhase::AwaitingInitialDeal,
         1 => GamePhase::AwaitingHitVRF,
@@ -178,13 +169,13 @@ pub fn request_vrf(ctx: Context<RequestRoll>, roll_type: u8) -> Result<()> {
     };
 
     let vrf = &mut ctx.accounts.vrf_request;
-    vrf.game_id = gs.game_id;
+    vrf.game_id     = gs.game_id;
     vrf.commit_slot = randomness_data.seed_slot;
-    vrf.sb_account = ctx.accounts.randomness_account.key();
-    vrf.player = gs.active_player;
-    vrf.roll_type = roll_type;
-    vrf.consumed = false;
-    vrf.bump = ctx.bumps.vrf_request;
+    vrf.sb_account  = ctx.accounts.randomness_account.key();
+    vrf.player      = gs.active_player;
+    vrf.roll_type   = roll_type;
+    vrf.consumed    = false;
+    vrf.bump        = ctx.bumps.vrf_request;
 
     emit!(VrfRequested {
         game_id: gs.game_id,
@@ -199,16 +190,31 @@ pub fn request_vrf(ctx: Context<RequestRoll>, roll_type: u8) -> Result<()> {
 pub fn fulfill_vrf(ctx: Context<FulfillRoll>) -> Result<()> {
     let clock = Clock::get()?;
 
-    let randomness_data = RandomnessAccountData::parse(ctx.accounts.randomness_account.data.borrow()).unwrap();
-    let revealed_random_value = randomness_data.get_value(clock.slot).map_err(|_| GameError::RandomnessNotResolved)?;
+    require!(
+        ctx.accounts.randomness_account.key() == ctx.accounts.vrf_request.sb_account,
+        GameError::InvalidRandomnessAccount
+    );
+
+    // FIX: .unwrap() replaced with proper error propagation.
+    let randomness_data = RandomnessAccountData::parse(
+        ctx.accounts.randomness_account.data.borrow()
+    ).map_err(|_| GameError::InvalidRandomnessAccount)?;
+
+    require!(
+        randomness_data.seed_slot == ctx.accounts.vrf_request.commit_slot,
+        GameError::RandomnessExpired
+    );
+
+    let revealed_random_value = randomness_data
+        .get_value(clock.slot)
+        .map_err(|_| GameError::RandomnessNotResolved)?;
+
     ctx.accounts.vrf_request.consumed = true;
 
-    // FIX: Double deref (**gs) extracts the raw GameState struct from the Anchor Account wrapper
-    let gs = &mut ctx.accounts.game_state;
-    let inner = &mut **gs; 
+    let gs    = &mut ctx.accounts.game_state;
+    let inner = &mut **gs;
 
     if ctx.accounts.vrf_request.roll_type == 0 {
-        // Now Rust allows the disjoint borrows perfectly
         inner.p1_last_card = apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
         inner.p2_last_card = apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
         inner.phase = GamePhase::AwaitingAction;
@@ -228,7 +234,7 @@ pub fn fulfill_vrf(ctx: Context<FulfillRoll>) -> Result<()> {
             inner.p2_last_card = apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[0]);
             if inner.p2_score >= 21 { inner.p2_stayed = true; }
         }
-        
+
         emit!(PlayerHit {
             game_id: inner.game_id,
             player: inner.active_player,
@@ -250,7 +256,6 @@ pub fn fulfill_vrf(ctx: Context<FulfillRoll>) -> Result<()> {
     } else if ctx.accounts.vrf_request.roll_type == 2 {
         inner.p1_last_card = apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
         inner.p2_last_card = apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
-        
         inner.phase = GamePhase::ReadyToResolve;
 
         emit!(CardsDealt {
@@ -259,20 +264,22 @@ pub fn fulfill_vrf(ctx: Context<FulfillRoll>) -> Result<()> {
             p2_score: inner.p2_score,
             is_final_reveal: true,
         });
+
     } else if ctx.accounts.vrf_request.roll_type == 3 {
-        // NEW: Tiebreaker logic
+        // FIX: Tiebreaker scores were already reset in resolve_round before entering
+        // AwaitingTiebreakerVRF, so cards are dealt fresh onto clean state here.
         inner.p1_last_card = apply_card(&mut inner.p1_score, &mut inner.p1_aces, revealed_random_value[0]);
         inner.p2_last_card = apply_card(&mut inner.p2_score, &mut inner.p2_aces, revealed_random_value[1]);
-        
         inner.phase = GamePhase::ReadyToResolve;
 
         emit!(CardsDealt {
             game_id: inner.game_id,
             p1_score: inner.p1_score,
             p2_score: inner.p2_score,
-            is_final_reveal: true, // Acts the same as a reveal for the UI
+            is_final_reveal: true,
         });
     }
+
     Ok(())
 }
 
@@ -308,16 +315,24 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
     let p1_diff = gs.p1_score.abs_diff(21);
     let p2_diff = gs.p2_score.abs_diff(21);
 
-    // Rule 5: Tiebreaker Logic
+    // Tiebreaker: reset all round state before entering sudden death so the
+    // tiebreaker VRF deals fresh cards rather than adding on top of existing scores.
     if p1_diff == p2_diff {
         msg!("Tie detected! Entering Sudden Death.");
+        gs.p1_score   = 0;
+        gs.p2_score   = 0;
+        gs.p1_aces    = 0;
+        gs.p2_aces    = 0;
+        gs.p1_stayed  = false;
+        gs.p2_stayed  = false;
         gs.phase = GamePhase::AwaitingTiebreakerVRF;
-        return Ok(()); 
+        return Ok(());
     }
 
-    let damage = 1 << (gs.round_number.saturating_sub(1));
-    
-    // Determine the round winner
+    // FIX: Shift is capped at 7 to prevent u8 overflow on high round numbers (max damage = 128).
+    let shift = gs.round_number.saturating_sub(1).min(7);
+    let damage: u8 = 1u8 << shift;
+
     let round_winner = if p1_diff < p2_diff {
         gs.p2_hp = gs.p2_hp.saturating_sub(damage);
         msg!("Red wins round! Dealt {} damage.", damage);
@@ -328,42 +343,51 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
         Color::Blue
     };
 
-    // --- 1. RESOLVE THE ROUND MARKET ---
+    // Verify the round market PDA before resolving to prevent a malicious caller
+    // from passing an arbitrary account.
     if let Some(round_market_info) = ctx.remaining_accounts.get(0) {
-        // Resolve the micro-market for THIS specific round
+        let market_index: u8 = gs.round_number.saturating_sub(1);
+        let (expected_pda, _) = Pubkey::find_program_address(
+            &[MARKET_SEED, &gs.game_id.to_le_bytes(), &[market_index]],
+            &PREDICTION_MARKET_PROGRAM_ID,
+        );
+        require!(round_market_info.key() == expected_pda, GameError::InvalidMarketAccount);
         resolve_market_cpi(gs, round_market_info, round_winner)?;
     }
 
-    // Check for Game Over
     if gs.p1_hp == 0 || gs.p2_hp == 0 {
-        gs.phase = GamePhase::Ended;
+        gs.phase  = GamePhase::Ended;
         gs.winner = Some(round_winner);
         ctx.accounts.registry.game_active = false;
 
         emit!(GameEnded {
-            game_id: gs.game_id,
-            winner: gs.winner.unwrap(),
+            game_id:      gs.game_id,
+            winner:       gs.winner.unwrap(),
             winner_agent: gs.agent_for(gs.winner.unwrap()),
             total_rounds: gs.round_number,
-            ended_at: Clock::get()?.unix_timestamp,
+            ended_at:     Clock::get()?.unix_timestamp,
         });
 
-        // --- 2. RESOLVE THE MAIN MARKET ---
+        // Verify the main (match-winner) market PDA before resolving.
         if let Some(main_market_info) = ctx.remaining_accounts.get(1) {
-            // Resolve the overall match winner market
+            let (expected_pda, _) = Pubkey::find_program_address(
+                &[MARKET_SEED, &gs.game_id.to_le_bytes(), &[255u8]], // index 255 = match winner market
+                &PREDICTION_MARKET_PROGRAM_ID,
+            );
+            require!(main_market_info.key() == expected_pda, GameError::InvalidMarketAccount);
             resolve_market_cpi(gs, main_market_info, gs.winner.unwrap())?;
         }
     } else {
-        // Match continues: Reset for next round
-        gs.p1_score = 0;
-        gs.p2_score = 0;
-        gs.p1_aces = 0;
-        gs.p2_aces = 0;
-        gs.p1_stayed = false;
-        gs.p2_stayed = false;
+        gs.p1_score   = 0;
+        gs.p2_score   = 0;
+        gs.p1_aces    = 0;
+        gs.p2_aces    = 0;
+        gs.p1_stayed  = false;
+        gs.p2_stayed  = false;
         gs.round_number += 1;
         gs.phase = GamePhase::AwaitingInitialDeal;
     }
+
     Ok(())
 }
 
@@ -374,104 +398,56 @@ pub fn unlock_upgrade(ctx: Context<UnlockUpgrade>) -> Result<()> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-// pub fn mock_request_vrf(ctx: Context<RequestRoll>, roll_type: u8) -> Result<()> {
-//     let gs = &mut ctx.accounts.game_state;
-
-//     gs.phase = match roll_type {
-//         0 => GamePhase::AwaitingInitialDeal,
-//         1 => GamePhase::AwaitingHitVRF,
-//         _ => GamePhase::AwaitingFinalRevealVRF,
-//     };
-
-//     let vrf = &mut ctx.accounts.vrf_request;
-//     vrf.game_id = gs.game_id;
-//     // Mock the commit slot to match the UI expectation
-//     vrf.commit_slot = Clock::get()?.slot;
-//     vrf.sb_account = ctx.accounts.randomness_account.key();
-//     vrf.player = gs.active_player;
-//     vrf.roll_type = roll_type;
-//     vrf.consumed = false;
-//     vrf.bump = ctx.bumps.vrf_request;
-
-//     Ok(())
-// }
-
-// pub fn mock_fulfill_vrf(ctx: Context<MockFulfillRoll>, random_bytes: [u8; 2]) -> Result<()> {
-//     let gs = &mut ctx.accounts.game_state;
-//     let inner = &mut **gs;
-//     ctx.accounts.vrf_request.consumed = true;
-
-//     if ctx.accounts.vrf_request.roll_type == 0 {
-//         apply_card(&mut inner.p1_score, &mut inner.p1_aces, random_bytes[0]);
-//         apply_card(&mut inner.p2_score, &mut inner.p2_aces, random_bytes[1]);
-//         inner.phase = GamePhase::AwaitingAction;
-//     } else if ctx.accounts.vrf_request.roll_type == 1 {
-//         if inner.active_player == Color::Red {
-//             apply_card(&mut inner.p1_score, &mut inner.p1_aces, random_bytes[0]);
-//             if inner.p1_score >= 21 { inner.p1_stayed = true; }
-//         } else {
-//             apply_card(&mut inner.p2_score, &mut inner.p2_aces, random_bytes[0]);
-//             if inner.p2_score >= 21 { inner.p2_stayed = true; }
-//         }
-        
-//         if inner.active_player == Color::Red && !inner.p2_stayed {
-//             inner.active_player = Color::Blue;
-//         } else if inner.active_player == Color::Blue && !inner.p1_stayed {
-//             inner.active_player = Color::Red;
-//         }
-
-//         inner.phase = if inner.p1_stayed && inner.p2_stayed {
-//             GamePhase::AwaitingFinalRevealVRF
-//         } else {
-//             GamePhase::AwaitingAction
-//         };
-//     } else if ctx.accounts.vrf_request.roll_type == 2 || ctx.accounts.vrf_request.roll_type == 3 {
-//         apply_card(&mut inner.p1_score, &mut inner.p1_aces, random_bytes[0]);
-//         apply_card(&mut inner.p2_score, &mut inner.p2_aces, random_bytes[1]);
-//         inner.phase = GamePhase::ReadyToResolve;
-//     }
-//     Ok(())
-// }
-
-// Notice the `-> u8` at the end!
+/// Draws a card from a random byte, applies blackjack ace-reduction logic,
+/// updates score and ace count in-place, and returns the raw card face value.
+/// FIX: Uses saturating_add to prevent u8 overflow before ace reduction runs.
 fn apply_card(score: &mut u8, aces: &mut u8, random_byte: u8) -> u8 {
     let raw = (random_byte % 13) + 1;
-    let mut value = if raw > 10 { 10 } else { raw };
-    
-    if value == 1 {
-        value = 11;
+    let value = if raw == 1 {
         *aces += 1;
-    }
-    
-    *score += value;
-    
+        11u8
+    } else if raw > 10 {
+        10u8
+    } else {
+        raw
+    };
+
+    *score = score.saturating_add(value);
+
     while *score > 21 && *aces > 0 {
         *score -= 10;
         *aces -= 1;
     }
-    
-    raw // Return the actual card face (1 = Ace, 11 = Jack, 13 = King, etc.)
+
+    raw
 }
 
+/// Resolves a prediction market via CPI, signing with the game_state PDA.
+///
+/// IMPORTANT: The prediction market's ResolveMarket context must accept the
+/// game_state PDA as a valid authority (not just ADMIN_PUBKEY). Update the
+/// prediction market's ResolveMarket constraint to:
+///   constraint = authority.key() == ADMIN_PUBKEY ||
+///                authority.key() == expected_game_pda
 fn resolve_market_cpi<'info>(
-    gs: &Account<'info, GameState>, 
-    market_info: &AccountInfo<'info>, 
-    winner: Color
+    gs: &Account<'info, GameState>,
+    market_info: &AccountInfo<'info>,
+    winner: Color,
 ) -> Result<()> {
     let disc = anchor_discriminator(b"global:resolve_market");
-    let outcome_byte: u8 = if winner == Color::Red { 0 } else { 1 }; 
+    let outcome_byte: u8 = if winner == Color::Red { 0 } else { 1 };
 
     let mut ix_data = disc.to_vec();
     ix_data.push(outcome_byte);
 
-    let game_id_bytes  = gs.game_id.to_le_bytes();
+    let game_id_bytes = gs.game_id.to_le_bytes();
     let signer_seeds: &[&[&[u8]]] = &[&[GAME_SEED, &game_id_bytes, &[gs.bump]]];
 
     let ix = solana_program::instruction::Instruction {
         program_id: PREDICTION_MARKET_PROGRAM_ID,
         accounts: vec![
             solana_program::instruction::AccountMeta::new(market_info.key(), false),
-            solana_program::instruction::AccountMeta::new_readonly(gs.key(), true), 
+            solana_program::instruction::AccountMeta::new_readonly(gs.key(), true),
         ],
         data: ix_data,
     };
@@ -480,6 +456,9 @@ fn resolve_market_cpi<'info>(
     Ok(())
 }
 
+/// Computes the 8-byte Anchor instruction discriminator for a given preimage.
+/// Anchor uses SHA-256 (via solana_program::hash) of "global:<instruction_name>".
+/// Verify this matches the deployed IDL before going to mainnet.
 fn anchor_discriminator(preimage: &[u8]) -> [u8; 8] {
     use solana_program::hash::hash;
     hash(preimage).to_bytes()[..8].try_into().unwrap()

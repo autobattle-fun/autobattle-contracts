@@ -22,23 +22,30 @@ pub struct Market {
     pub outcome:          Option<Outcome>, // 2
     pub expires_at:       i64,          // 8
     pub created_at:       i64,          // 8
-    pub claims_remaining: u64,          // 8
     pub fee_balance:      u64,          // 8  <-- NEW FIELD (Tracks uncollected fees)
     pub bump:             u8,           // 1
     pub vault_bump:       u8,           // 1
+    pub lp_withdrawn: bool,
 }
 
 impl Market {
-    pub const LEN: usize = 8     // discriminator
-        + 8 + 1                  // game_id, market_index
-        + (4 + 128)              // question string
-        + 8 + 8 + 8              // yes_supply, no_supply, total_volume
-        + 1 + 2                  // resolved, outcome
-        + 8 + 8                  // expires_at, created_at
-        + 8                      // claims_remaining
-        + 8                      // fee_balance
-        + 1 + 1                  // bumps
-        + 24;                    // headroom (Reduced from 32 to 24 to keep size identical)
+    pub const LEN: usize = 
+          8     // Anchor discriminator
+        + 8     // game_id
+        + 1     // market_index
+        + 132   // question (4 byte string length prefix + 128 bytes data)
+        + 8     // yes_supply
+        + 8     // no_supply
+        + 8     // total_volume
+        + 1     // resolved (bool)
+        + 2     // outcome (Option<Outcome> = 1 byte discriminant + 1 byte enum payload)
+        + 8     // expires_at
+        + 8     // created_at
+        + 8     // fee_balance
+        + 1     // bump
+        + 1     // vault_bump
+        + 1     // lp_withdrawn
+        + 31;   // headroom padding to reach exactly 234 bytes
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

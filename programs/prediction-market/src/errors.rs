@@ -43,4 +43,10 @@ pub enum MarketError {
 
     #[msg("Bet size exceeds the mathematical limits of the AMM")]
     BetTooLarge,
+
+    #[msg("LP has already been withdrawn")]
+    LpAlreadyWithdrawn,
+
+    #[msg("Invalid mint account")]
+    InvalidMint,
 }
