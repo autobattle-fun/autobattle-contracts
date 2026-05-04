@@ -49,4 +49,10 @@ pub enum MarketError {
 
     #[msg("Invalid mint account")]
     InvalidMint,
+
+    #[msg("Market index must be less than 250.")]
+    InvalidMarketIndex,
+
+    #[msg("Trade amount is too small, resulting in zero fees.")]
+    TradeTooSmall,
 }

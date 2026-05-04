@@ -9,6 +9,7 @@ pub enum Color {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GamePhase {
     AwaitingInitialDeal,
+    AwaitingInitialDealVRF,
     AwaitingHitVRF,
     AwaitingAction,
     AwaitingFinalRevealVRF,

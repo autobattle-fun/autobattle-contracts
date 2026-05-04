@@ -55,3 +55,9 @@ pub struct GameEnded {
     pub total_rounds: u8,
     pub ended_at: i64,
 }
+
+#[event]
+pub struct UpgradeUnlocked {
+    pub game_id: u64,
+    pub timestamp: i64,
+}

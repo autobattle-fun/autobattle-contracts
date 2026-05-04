@@ -46,4 +46,12 @@ pub enum GameError {
     InvalidMarketAccount,
     #[msg("Signer is not the authorized crank for this operation")]
     UnauthorizedCrank,
+    #[msg("Player has already stayed.")]
+    AlreadyStayed,
+    #[msg("Invalid roll type requested.")]
+    InvalidRollType,
+    #[msg("A VRF request is already pending for this game.")]
+    VrfAlreadyPending,
+    #[msg("Missing required prediction market accounts.")]
+    MissingMarketAccounts,
 }

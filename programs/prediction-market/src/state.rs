@@ -55,6 +55,7 @@ impl Market {
 
 #[account]
 pub struct UserPosition {
+    pub is_initialized: bool,
     pub user:         Pubkey,    // 32
     pub game_id:      u64,       // 8
     pub market_index: u8,        // 1
@@ -66,5 +67,6 @@ pub struct UserPosition {
 }
 
 impl UserPosition {
-    pub const LEN: usize = 8 + 32 + 8 + 1 + 8 + 8 + 1 + 1 + 16; // +16 headroom
+    // 8 (discriminator) + 1 (bool) + 32 (Pubkey) + 8 (u64) + 1 (u8) + 8 (u64) + 8 (u64) + 1 (bool) + 1 (u8)
+    pub const LEN: usize = 8 + 1 + 32 + 8 + 1 + 8 + 8 + 1 + 1;
 }

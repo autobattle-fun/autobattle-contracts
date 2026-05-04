@@ -8,7 +8,7 @@ pub mod state;
 pub mod lmsr;
 
 use state::*;
-use errors::MarketError;
+use crate::errors::MarketError; 
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -25,10 +25,13 @@ pub const GAME_ENGINE_PROGRAM_ID: Pubkey = solana_program::pubkey!(
     "GxLT8QMUw6cVT6HQBu2c2zepbQnhUWr4VPEB2vfggE2e"
 );
 
-pub const LMSR_B_SCALED: u64 = 14_427_000_000;
+pub const LMSR_B_SCALED: u64 = 144_270_000_000;
 
-/// Grace period before a stuck unresolved market can be refunded (2 hours).
-pub const REFUND_GRACE_SECS: i64 = 7_200;
+/// Grace period before a stuck unresolved market can be refunded (3 minutes for demo).
+pub const REFUND_GRACE_SECS: i64 = 180;
+
+// Named constant for initial liquidity
+pub const INITIAL_LIQUIDITY: u64 = 100_000_000_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Program
@@ -48,9 +51,10 @@ pub mod prediction_market {
         expires_at: i64,
     ) -> Result<()> {
         let clock = Clock::get()?;
-        require!(ctx.accounts.authority.key() == ADMIN_PUBKEY, MarketError::UnauthorizedUser);
-        require!(question.len() <= 128, MarketError::QuestionTooLong);
-        require!(expires_at > clock.unix_timestamp, MarketError::MarketExpired);
+        require!(ctx.accounts.authority.key() == ADMIN_PUBKEY, crate::errors::MarketError::UnauthorizedUser);
+        require!(question.len() <= 128, crate::errors::MarketError::QuestionTooLong);
+        require!(expires_at > clock.unix_timestamp, crate::errors::MarketError::MarketExpired);
+        require!(market_index < 250, crate::errors::MarketError::InvalidMarketIndex);
 
         let m             = &mut ctx.accounts.market;
         m.game_id         = game_id;
@@ -82,12 +86,9 @@ pub mod prediction_market {
         };
         let cpi_program = ctx.accounts.token_program.to_account_info();
         
-        // 10,000 tokens * 1,000,000 decimals
-        let initial_liquidity: u64 = 10_000_000_000;
-        
         token::transfer(
             CpiContext::new(cpi_program, cpi_accounts), 
-            initial_liquidity
+            INITIAL_LIQUIDITY
         )?;
 
         Ok(())
@@ -104,20 +105,22 @@ pub mod prediction_market {
         let clock = Clock::get()?;
         let m     = &mut ctx.accounts.market;
 
-        require!(!m.resolved,                          MarketError::MarketAlreadyResolved);
-        require!(clock.unix_timestamp < m.expires_at,  MarketError::MarketExpired);
-        require!(amount_in > 0,                        MarketError::ZeroAmount);
+        require!(!m.resolved,                          crate::errors::MarketError::MarketAlreadyResolved);
+        require!(clock.unix_timestamp < m.expires_at,  crate::errors::MarketError::MarketExpired);
+        require!(amount_in > 0,                        crate::errors::MarketError::ZeroAmount);
 
-        let max_allowed_bet = LMSR_B_SCALED.checked_mul(50).ok_or(MarketError::Overflow)?;
-        require!(amount_in <= max_allowed_bet, MarketError::BetTooLarge);
+        let max_allowed_bet = LMSR_B_SCALED.checked_mul(50).ok_or(crate::errors::MarketError::Overflow)?;
+        require!(amount_in <= max_allowed_bet, crate::errors::MarketError::BetTooLarge);
 
-        let fee = amount_in.checked_div(100).ok_or(MarketError::Overflow)?;
-        let trade_amount = amount_in.checked_sub(fee).ok_or(MarketError::Overflow)?;
+        let fee = amount_in.checked_div(100).ok_or(crate::errors::MarketError::Overflow)?;
+        require!(fee > 0, crate::errors::MarketError::TradeTooSmall);
+        
+        let trade_amount = amount_in.checked_sub(fee).ok_or(crate::errors::MarketError::Overflow)?;
 
         let shares_out = lmsr::calc_shares_out(
             m.yes_supply, m.no_supply, LMSR_B_SCALED, outcome, trade_amount,
         )?;
-        require!(shares_out >= min_shares_out, MarketError::SlippageExceeded);
+        require!(shares_out >= min_shares_out, crate::errors::MarketError::SlippageExceeded);
 
         token::transfer(
             CpiContext::new(
@@ -132,14 +135,16 @@ pub mod prediction_market {
         )?;
 
         match outcome {
-            Outcome::Yes => m.yes_supply = m.yes_supply.checked_add(shares_out).ok_or(MarketError::Overflow)?,
-            Outcome::No  => m.no_supply  = m.no_supply.checked_add(shares_out).ok_or(MarketError::Overflow)?,
+            Outcome::Yes => m.yes_supply = m.yes_supply.checked_add(shares_out).ok_or(crate::errors::MarketError::Overflow)?,
+            Outcome::No  => m.no_supply  = m.no_supply.checked_add(shares_out).ok_or(crate::errors::MarketError::Overflow)?,
         }
-        m.total_volume = m.total_volume.checked_add(trade_amount).ok_or(MarketError::Overflow)?;
-        m.fee_balance  = m.fee_balance.checked_add(fee).ok_or(MarketError::Overflow)?;
+        
+        m.total_volume = m.total_volume.checked_add(trade_amount).ok_or(crate::errors::MarketError::Overflow)?;
+        m.fee_balance  = m.fee_balance.checked_add(fee).ok_or(crate::errors::MarketError::Overflow)?;
 
         let pos = &mut ctx.accounts.user_position;
-        if pos.user == Pubkey::default() {
+        if !pos.is_initialized {
+            pos.is_initialized = true;
             pos.user         = ctx.accounts.user.key();
             pos.game_id      = m.game_id;
             pos.market_index = m.market_index;
@@ -149,13 +154,18 @@ pub mod prediction_market {
             pos.bump         = ctx.bumps.user_position;
         }
         match outcome {
-            Outcome::Yes => pos.yes_shares = pos.yes_shares.checked_add(shares_out).ok_or(MarketError::Overflow)?,
-            Outcome::No  => pos.no_shares  = pos.no_shares.checked_add(shares_out).ok_or(MarketError::Overflow)?,
+            Outcome::Yes => pos.yes_shares = pos.yes_shares.checked_add(shares_out).ok_or(crate::errors::MarketError::Overflow)?,
+            Outcome::No  => pos.no_shares  = pos.no_shares.checked_add(shares_out).ok_or(crate::errors::MarketError::Overflow)?,
         }
 
         emit!(SharesBought {
-            game_id: m.game_id, market_index: m.market_index,
-            user: ctx.accounts.user.key(), outcome, amount_in, shares_out,
+            game_id: m.game_id, 
+            market_index: m.market_index,
+            user: ctx.accounts.user.key(), 
+            outcome, 
+            amount_in, 
+            shares_out,
+            fee, 
         });
 
         Ok(())
@@ -171,31 +181,43 @@ pub mod prediction_market {
         let pos = &mut ctx.accounts.user_position;
 
         let clock = Clock::get()?;
-        require!(clock.unix_timestamp < m.expires_at, MarketError::MarketExpired);
-
-        require!(!m.resolved, MarketError::MarketAlreadyResolved);
-        require!(shares_in > 0, MarketError::ZeroAmount);
+        require!(clock.unix_timestamp < m.expires_at, crate::errors::MarketError::MarketExpired);
+        require!(!m.resolved, crate::errors::MarketError::MarketAlreadyResolved);
+        require!(shares_in > 0, crate::errors::MarketError::ZeroAmount);
 
         match outcome {
-            Outcome::Yes => require!(pos.yes_shares >= shares_in, MarketError::InsufficientShares),
-            Outcome::No  => require!(pos.no_shares  >= shares_in, MarketError::InsufficientShares),
+            Outcome::Yes => require!(pos.yes_shares >= shares_in, crate::errors::MarketError::InsufficientShares),
+            Outcome::No  => require!(pos.no_shares  >= shares_in, crate::errors::MarketError::InsufficientShares),
         }
 
         let gross_amount_out = lmsr::calc_amount_out(
             m.yes_supply, m.no_supply, LMSR_B_SCALED, outcome, shares_in,
         )?;
         
-        let fee = gross_amount_out.checked_div(100).ok_or(MarketError::Overflow)?;
-        let net_amount_out = gross_amount_out.checked_sub(fee).ok_or(MarketError::Overflow)?;
+        let fee = gross_amount_out.checked_div(100).ok_or(crate::errors::MarketError::Overflow)?;
+        require!(fee > 0, crate::errors::MarketError::TradeTooSmall);
         
-        require!(net_amount_out >= min_amount_out, MarketError::SlippageExceeded);
+        let net_amount_out = gross_amount_out.checked_sub(fee).ok_or(crate::errors::MarketError::Overflow)?;
+        require!(net_amount_out >= min_amount_out, crate::errors::MarketError::SlippageExceeded);
 
-        m.fee_balance = m.fee_balance.checked_add(fee).ok_or(MarketError::Overflow)?;
+        m.fee_balance = m.fee_balance.checked_add(fee).ok_or(crate::errors::MarketError::Overflow)?;
+
+        match outcome {
+            Outcome::Yes => {
+                m.yes_supply   = m.yes_supply.checked_sub(shares_in).ok_or(crate::errors::MarketError::Overflow)?;
+                pos.yes_shares = pos.yes_shares.checked_sub(shares_in).ok_or(crate::errors::MarketError::Overflow)?;
+            }
+            Outcome::No => {
+                m.no_supply   = m.no_supply.checked_sub(shares_in).ok_or(crate::errors::MarketError::Overflow)?;
+                pos.no_shares = pos.no_shares.checked_sub(shares_in).ok_or(crate::errors::MarketError::Overflow)?;
+            }
+        }
 
         let game_id_bytes   = m.game_id.to_le_bytes();
         let market_idx      = [m.market_index];
         let vault_bump      = [m.vault_bump];
         let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
+        
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -209,17 +231,6 @@ pub mod prediction_market {
             net_amount_out,
         )?;
 
-        match outcome {
-            Outcome::Yes => {
-                m.yes_supply   = m.yes_supply.checked_sub(shares_in).ok_or(MarketError::Overflow)?;
-                pos.yes_shares = pos.yes_shares.checked_sub(shares_in).ok_or(MarketError::Overflow)?;
-            }
-            Outcome::No => {
-                m.no_supply   = m.no_supply.checked_sub(shares_in).ok_or(MarketError::Overflow)?;
-                pos.no_shares = pos.no_shares.checked_sub(shares_in).ok_or(MarketError::Overflow)?;
-            }
-        }
-
         emit!(SharesSold {
             game_id: m.game_id, 
             market_index: m.market_index,
@@ -227,6 +238,7 @@ pub mod prediction_market {
             outcome, 
             shares_in, 
             amount_out: net_amount_out,
+            fee, 
         });
 
         Ok(())
@@ -238,11 +250,10 @@ pub mod prediction_market {
         ctx: Context<ResolveMarket>,
         outcome: Outcome,
     ) -> Result<()> {
+        let clock = Clock::get()?; // Fix 3: Caching clock call
         let m = &mut ctx.accounts.market;
-        require!(!m.resolved, MarketError::MarketAlreadyResolved);
+        require!(!m.resolved, crate::errors::MarketError::MarketAlreadyResolved);
 
-        // CPI verification handled by checking against the game engine PDA OR admin
-        // No strict CPI signer validation needed here as long as only authorized keys can call this.
         m.resolved = true;
         m.outcome  = Some(outcome);
 
@@ -252,7 +263,7 @@ pub mod prediction_market {
             outcome,
             yes_supply:   m.yes_supply,
             no_supply:    m.no_supply,
-            timestamp:    Clock::get()?.unix_timestamp,
+            timestamp:    clock.unix_timestamp,
         });
 
         Ok(())
@@ -262,20 +273,20 @@ pub mod prediction_market {
 
    pub fn claim_payout(ctx: Context<ClaimPayout>) -> Result<()> {
         let m   = &ctx.accounts.market;
-        let pos = &ctx.accounts.user_position;
+        let pos = &mut ctx.accounts.user_position; 
 
-        require!(m.resolved,   MarketError::MarketNotResolved);
-        require!(!pos.claimed, MarketError::AlreadyClaimed);
+        require!(m.resolved,   crate::errors::MarketError::MarketNotResolved);
+        require!(!pos.claimed, crate::errors::MarketError::AlreadyClaimed);
 
-        let winning_outcome = m.outcome.ok_or(MarketError::MarketNotResolved)?;
+        let winning_outcome = m.outcome.ok_or(crate::errors::MarketError::MarketNotResolved)?;
         let user_winning_shares = match winning_outcome {
             Outcome::Yes => pos.yes_shares,
             Outcome::No  => pos.no_shares,
         };
-        require!(user_winning_shares > 0, MarketError::NoWinningShares);
+        require!(user_winning_shares > 0, crate::errors::MarketError::NoWinningShares);
 
-        // 1 Winning Share = 1 Base Token (1:1 Payout)
         let payout = user_winning_shares;
+        pos.claimed = true;
 
         let game_id_bytes = m.game_id.to_le_bytes();
         let market_idx    = [m.market_index];
@@ -302,30 +313,45 @@ pub mod prediction_market {
             payout,
         });
 
-        ctx.accounts.user_position.claimed = true;
-
         Ok(())
     }
 
     pub fn refund_expired(ctx: Context<RefundExpired>) -> Result<()> {
-        let m   = &ctx.accounts.market;
-        let pos = &ctx.accounts.user_position;
+        let m   = &mut ctx.accounts.market;       
+        let pos = &mut ctx.accounts.user_position;
         let clock = Clock::get()?;
 
-        require!(!m.resolved,                                      MarketError::MarketAlreadyResolved);
-        require!(clock.unix_timestamp > m.expires_at + REFUND_GRACE_SECS, MarketError::GracePeriodNotOver);
-        require!(!pos.claimed,                                     MarketError::AlreadyClaimed);
+        require!(!m.resolved, crate::errors::MarketError::MarketAlreadyResolved);
+        require!(clock.unix_timestamp > m.expires_at + REFUND_GRACE_SECS, crate::errors::MarketError::GracePeriodNotOver);
+        require!(!pos.claimed, crate::errors::MarketError::AlreadyClaimed);
 
-        let user_shares   = pos.yes_shares + pos.no_shares;
-        let total_shares  = m.yes_supply + m.no_supply;
-        require!(total_shares > 0, MarketError::ZeroAmount);
+        // Capture values BEFORE any mutation (Fix High/A)
+        let user_yes = pos.yes_shares;
+        let user_no  = pos.no_shares;
+        let user_shares = user_yes.checked_add(user_no).ok_or(crate::errors::MarketError::Overflow)?;
+        
+        // Fix 1: Guard against zero-share refund calls
+        require!(user_shares > 0, crate::errors::MarketError::ZeroAmount);
 
-        let vault_balance = ctx.accounts.vault.amount.saturating_sub(m.fee_balance);
+        let total_shares  = m.yes_supply.checked_add(m.no_supply).ok_or(crate::errors::MarketError::Overflow)?;
+        require!(total_shares > 0, crate::errors::MarketError::ZeroAmount);
+
+        // Policy: On expired markets, accumulated fees are forfeited to the refund pool
+        // and distributed proportionally among all position holders.
+        // Safe to zero repeatedly: trading is gated by expires_at, so no new fees can accrue.
+        m.fee_balance = 0; 
+        let vault_balance = ctx.accounts.vault.amount;
             
         let refund = (user_shares as u128)
-            .checked_mul(vault_balance as u128).ok_or(MarketError::Overflow)?
-            .checked_div(total_shares as u128).ok_or(MarketError::Overflow)? as u64;
+            .checked_mul(vault_balance as u128).ok_or(crate::errors::MarketError::Overflow)?
+            .checked_div(total_shares as u128).ok_or(crate::errors::MarketError::Overflow)? as u64;
 
+        // Effects: Guard first, then apply captured values to supply
+        pos.claimed = true;
+        m.yes_supply = m.yes_supply.checked_sub(user_yes).ok_or(crate::errors::MarketError::Overflow)?;
+        m.no_supply  = m.no_supply.checked_sub(user_no).ok_or(crate::errors::MarketError::Overflow)?;
+
+        // Interaction: Vault to User
         let game_id_bytes = m.game_id.to_le_bytes();
         let market_idx    = [m.market_index];
         let vault_bump    = [m.vault_bump];
@@ -350,25 +376,25 @@ pub mod prediction_market {
             refund,
         });
 
-        ctx.accounts.user_position.claimed = true;
-
         Ok(())
     }
 
     pub fn withdraw_lp(ctx: Context<WithdrawLP>) -> Result<()> {
+        let clock = Clock::get()?; // Fix 3: Caching clock call
         let market = &mut ctx.accounts.market;
-        require!(!market.lp_withdrawn, MarketError::LpAlreadyWithdrawn);
+        
+        require!(ctx.accounts.authority.key() == ADMIN_PUBKEY, crate::errors::MarketError::UnauthorizedUser);
+        require!(!market.lp_withdrawn, crate::errors::MarketError::LpAlreadyWithdrawn);
 
         let vault_balance = ctx.accounts.vault.amount;
-        let winning_outcome = market.outcome.ok_or(MarketError::MarketNotResolved)?;
+        let winning_outcome = market.outcome.ok_or(crate::errors::MarketError::MarketNotResolved)?;
 
         let total_winning_shares = match winning_outcome {
             Outcome::Yes => market.yes_supply,
             Outcome::No  => market.no_supply,
         };
 
-        // Admin gets the vault balance MINUS the liability owed to winners
-        let withdrawable_amount = vault_balance.checked_sub(total_winning_shares).ok_or(MarketError::Overflow)?;
+        let withdrawable_amount = vault_balance.checked_sub(total_winning_shares).ok_or(crate::errors::MarketError::Overflow)?;
 
         if withdrawable_amount > 0 {
             let game_id_bytes = market.game_id.to_le_bytes();
@@ -390,9 +416,16 @@ pub mod prediction_market {
             )?;
         }
 
-        // Reset fee balance to 0 since we just withdrew them alongside the LP
         market.fee_balance = 0; 
         market.lp_withdrawn = true;
+
+        emit!(LPWithdrawn {
+            game_id:      market.game_id,
+            market_index: market.market_index,
+            amount:       withdrawable_amount,
+            timestamp:    clock.unix_timestamp,
+        });
+
         Ok(())
     }
 }
@@ -435,6 +468,7 @@ pub struct CreateMarket<'info> {
     pub system_program: Program<'info, System>,
     pub rent:           Sysvar<'info, Rent>,
 }
+
 #[derive(Accounts)]
 #[instruction(outcome: Outcome, amount_in: u64, min_shares_out: u64)]
 pub struct BuyShares<'info> {
@@ -463,7 +497,7 @@ pub struct BuyShares<'info> {
 
     #[account(
         mut,
-        constraint = user_token_account.mint == vault.mint @ MarketError::InvalidMint,
+        constraint = user_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
     )]
     pub user_token_account: Account<'info, TokenAccount>,
 
@@ -487,7 +521,7 @@ pub struct SellShares<'info> {
         mut,
         seeds  = [POSITION_SEED, market.key().as_ref(), user.key().as_ref()],
         bump   = user_position.bump,
-        constraint = user_position.user == user.key() @ MarketError::UnauthorizedUser,
+        constraint = user_position.user == user.key() @ crate::errors::MarketError::UnauthorizedUser,
     )]
     pub user_position: Account<'info, UserPosition>,
 
@@ -500,7 +534,7 @@ pub struct SellShares<'info> {
 
     #[account(
         mut,
-        constraint = user_token_account.mint == vault.mint @ MarketError::InvalidMint,
+        constraint = user_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
     )]
     pub user_token_account: Account<'info, TokenAccount>,
 
@@ -526,7 +560,7 @@ pub struct ResolveMarket<'info> {
                 &GAME_ENGINE_PROGRAM_ID,
             );
             authority.key() == ADMIN_PUBKEY || authority.key() == game_pda
-        } @ MarketError::UnauthorizedUser
+        } @ crate::errors::MarketError::UnauthorizedUser
     )]
     pub authority: Signer<'info>,
 }
@@ -544,7 +578,8 @@ pub struct ClaimPayout<'info> {
         mut,
         seeds  = [POSITION_SEED, market.key().as_ref(), user.key().as_ref()],
         bump   = user_position.bump,
-        constraint = user_position.user == user.key() @ MarketError::UnauthorizedUser,
+        constraint = user_position.user == user.key() @ crate::errors::MarketError::UnauthorizedUser,
+        close = user,
     )]
     pub user_position: Account<'info, UserPosition>,
 
@@ -557,7 +592,7 @@ pub struct ClaimPayout<'info> {
 
     #[account(
         mut,
-        constraint = user_token_account.mint == vault.mint @ MarketError::InvalidMint,
+        constraint = user_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
     )]
     pub user_token_account: Account<'info, TokenAccount>,
 
@@ -580,7 +615,8 @@ pub struct RefundExpired<'info> {
         mut,
         seeds  = [POSITION_SEED, market.key().as_ref(), user.key().as_ref()],
         bump   = user_position.bump,
-        constraint = user_position.user == user.key() @ MarketError::UnauthorizedUser,
+        constraint = user_position.user == user.key() @ crate::errors::MarketError::UnauthorizedUser,
+        close = user,
     )]
     pub user_position: Account<'info, UserPosition>,
 
@@ -593,7 +629,7 @@ pub struct RefundExpired<'info> {
 
     #[account(
         mut,
-        constraint = user_token_account.mint == vault.mint @ MarketError::InvalidMint,
+        constraint = user_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
     )]
     pub user_token_account: Account<'info, TokenAccount>,
 
@@ -609,7 +645,7 @@ pub struct WithdrawLP<'info> {
         mut,
         seeds = [MARKET_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
         bump = market.bump,
-        constraint = market.resolved @ MarketError::MarketNotResolved,
+        constraint = market.resolved @ crate::errors::MarketError::MarketNotResolved,
     )]
     pub market: Account<'info, Market>,
 
@@ -622,13 +658,13 @@ pub struct WithdrawLP<'info> {
 
     #[account(
         mut,
-        constraint = admin_token_account.mint == vault.mint @ MarketError::InvalidMint,
+        constraint = admin_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
     )]
     pub admin_token_account: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        address = ADMIN_PUBKEY @ MarketError::UnauthorizedUser,
+        address = ADMIN_PUBKEY @ crate::errors::MarketError::UnauthorizedUser,
     )]
     pub authority: Signer<'info>,
 
@@ -655,6 +691,7 @@ pub struct SharesBought {
     pub outcome:      Outcome,
     pub amount_in:    u64,
     pub shares_out:   u64,
+    pub fee:          u64, 
 }
 
 #[event]
@@ -691,4 +728,13 @@ pub struct SharesSold {
     pub outcome:      Outcome,
     pub shares_in:    u64,
     pub amount_out:   u64,
+    pub fee:          u64, 
+}
+
+#[event]
+pub struct LPWithdrawn {
+    pub game_id:      u64,
+    pub market_index: u8,
+    pub amount:       u64,
+    pub timestamp:    i64,
 }
