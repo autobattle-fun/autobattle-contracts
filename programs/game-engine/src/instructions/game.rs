@@ -342,6 +342,8 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
         gs.p2_aces    = 0;
         gs.p1_stayed  = false;
         gs.p2_stayed  = false;
+
+        gs.active_player = Color::Red;
         
         gs.pending_commit_slot = 0; 
         gs.phase = GamePhase::AwaitingTiebreakerVRF;
@@ -417,6 +419,8 @@ pub fn resolve_round<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveRound<'inf
         gs.p2_aces    = 0;
         gs.p1_stayed  = false;
         gs.p2_stayed  = false;
+
+        gs.active_player = Color::Red;
         
         gs.round_number = gs.round_number.checked_add(1).ok_or(GameError::Overflow)?;
         gs.phase = GamePhase::AwaitingInitialDeal;
