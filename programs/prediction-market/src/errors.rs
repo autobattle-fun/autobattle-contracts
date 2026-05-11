@@ -55,4 +55,13 @@ pub enum MarketError {
 
     #[msg("Trade amount is too small, resulting in zero fees.")]
     TradeTooSmall,
+
+    #[msg("LP must withdraw before users can claim.")]
+    LpNotYetWithdrawn,
+
+    #[msg("Claim window has expired — use sweep_unclaimed.")]
+    ClaimWindowExpired,
+    
+    #[msg("Claim window not yet over — wait 48 hours after resolution.")]
+    ClaimWindowNotOver,
 }
