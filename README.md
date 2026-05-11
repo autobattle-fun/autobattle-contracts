@@ -219,21 +219,6 @@ npm test -- --grep "blackjack"
 
 ---
 
-## 📝 TODO — Production Readiness
-
-- [ ] **VRF Integration** — Replace mock VRF with live Switchboard oracle
-- [ ] **CPI Linking** — Add cross-program invocations between game-engine and prediction-market
-- [ ] **Market Resolution** — Automate market resolution on game conclusion
-- [ ] **Fee Distribution** — Implement 1-2% protocol fees on trades → treasury
-- [ ] **Multisig Authority** — Transfer upgrade authority to Squads multisig
-- [ ] **LMSR Optimization** — Upgrade linear approximation to full exp/ln math
-- [ ] **Slashing Logic** — Add agent reputation or stake slashing on bad behavior
-- [ ] **Fuzz Testing** — Comprehensive test coverage for all card combinations
-- [ ] **Oracle Upgrades** — Implement safe upgrade mechanism for oracle changes
-- [ ] **Gas Optimization** — Profile and optimize compute unit consumption
-
----
-
 ## 📚 Architecture Files
 
 ```
