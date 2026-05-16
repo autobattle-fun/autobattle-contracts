@@ -464,37 +464,53 @@ pub mod prediction_market {
 
     pub fn sweep_unclaimed(ctx: Context<SweepUnclaimed>) -> Result<()> {
         let clock  = Clock::get()?;
-        let market = &mut ctx.accounts.market;
+        let market = &ctx.accounts.market;
 
-        require!(ctx.accounts.authority.key() == ADMIN_PUBKEY, crate::errors::MarketError::UnauthorizedUser);
-        require!(market.resolved,     crate::errors::MarketError::MarketNotResolved);
-        require!(market.lp_withdrawn, crate::errors::MarketError::LpNotYetWithdrawn);
+        require!(ctx.accounts.authority.key() == ADMIN_PUBKEY, MarketError::UnauthorizedUser);
+        require!(market.resolved,     MarketError::MarketNotResolved);
+        require!(market.lp_withdrawn, MarketError::LpNotYetWithdrawn);
         require!(
             clock.unix_timestamp > market.resolved_at + CLAIM_WINDOW_SECS,
-            crate::errors::MarketError::ClaimWindowNotOver
+            MarketError::ClaimWindowNotOver
         );
 
         let remaining = ctx.accounts.vault.amount;
 
-        if remaining > 0 {
-            let game_id_bytes = market.game_id.to_le_bytes();
-            let market_idx    = [market.market_index];
-            let vault_bump    = [market.vault_bump];
-            let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
+        let game_id_bytes = market.game_id.to_le_bytes();
+        let market_idx    = [market.market_index];
+        let vault_bump    = [market.vault_bump];
+        let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
 
+        // 1. Transfer remaining tokens to admin
+        if remaining > 0 {
             token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer {
-                        from:      ctx.accounts.vault.to_account_info(),
-                        to:        ctx.accounts.admin_token_account.to_account_info(),
-                        authority: ctx.accounts.vault.to_account_info(),
-                    },
-                    &[vault_seeds],
-                ),
-                remaining,
-            )?;
-        }
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from:      ctx.accounts.vault.to_account_info(),
+                    to:        ctx.accounts.admin_token_account.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                &[vault_seeds],
+            ),
+            remaining,
+        )?;
+    }
+
+        // 2. Close vault token account — returns rent to authority
+        token::close_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token::CloseAccount {
+                    account:     ctx.accounts.vault.to_account_info(),
+                    destination: ctx.accounts.authority.to_account_info(),
+                    authority:   ctx.accounts.vault.to_account_info(),
+                },
+                &[vault_seeds],
+            ),
+        )?;
+
+        // 3. Market account closed via `close = authority` in context
 
         emit!(UnclaimedSwept {
             game_id:      market.game_id,
@@ -502,7 +518,7 @@ pub mod prediction_market {
             amount:       remaining,
             timestamp:    clock.unix_timestamp,
         });
-
+        
         Ok(())
     }
 }
@@ -754,8 +770,9 @@ pub struct SweepUnclaimed<'info> {
         mut,
         seeds = [MARKET_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
         bump  = market.bump,
-        constraint = market.resolved    @ crate::errors::MarketError::MarketNotResolved,
-        constraint = market.lp_withdrawn @ crate::errors::MarketError::LpNotYetWithdrawn,
+        constraint = market.resolved     @ MarketError::MarketNotResolved,
+        constraint = market.lp_withdrawn @ MarketError::LpNotYetWithdrawn,
+        close = authority,
     )]
     pub market: Account<'info, Market>,
 
@@ -768,17 +785,18 @@ pub struct SweepUnclaimed<'info> {
 
     #[account(
         mut,
-        constraint = admin_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
+        constraint = admin_token_account.mint == vault.mint @ MarketError::InvalidMint,
     )]
     pub admin_token_account: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        address = ADMIN_PUBKEY @ crate::errors::MarketError::UnauthorizedUser,
+        address = ADMIN_PUBKEY @ MarketError::UnauthorizedUser,
     )]
     pub authority: Signer<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program:  Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
