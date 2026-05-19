@@ -298,13 +298,8 @@ pub mod prediction_market {
         };
         require!(user_winning_shares > 0, crate::errors::MarketError::NoWinningShares);
 
-        let payout = (user_winning_shares as u128)
-            .checked_mul(m.winner_payout_ratio as u128)
-            .ok_or(crate::errors::MarketError::Overflow)?
-            .checked_div(1_000_000_000u128)
-            .ok_or(crate::errors::MarketError::Overflow)? as u64;
-
-        require!(payout > 0, crate::errors::MarketError::ZeroAmount);
+        // 1:1 payout
+        let payout = user_winning_shares;
         pos.claimed = true;
 
         let game_id_bytes = m.game_id.to_le_bytes();
@@ -407,32 +402,16 @@ pub mod prediction_market {
         };
 
         // ── LP Protection Logic ──────────────────────────────────────
-        let lp_recovery = if vault_balance >= INITIAL_LIQUIDITY {
-            let surplus = vault_balance - INITIAL_LIQUIDITY;
-            if surplus >= total_winning_shares {
-                vault_balance - total_winning_shares
-            } else {
-                INITIAL_LIQUIDITY
-            }
-        } else {
-            vault_balance
-        };
+        // If vault can't cover winning shares, LP gets 0 (not an error)
+        let withdrawable_amount = vault_balance.saturating_sub(total_winning_shares);
 
-        let remaining_for_winners = vault_balance.saturating_sub(lp_recovery);
-        market.winner_payout_ratio = if total_winning_shares > 0 {
-            (remaining_for_winners as u128)
-                .checked_mul(1_000_000_000u128)
-                .ok_or(crate::errors::MarketError::Overflow)?
-                .checked_div(total_winning_shares as u128)
-                .ok_or(crate::errors::MarketError::Overflow)? as u64
-        } else {
-            0
-        };
+        // Set ratio to 1:1 — winners always get full share value
+        market.winner_payout_ratio = 1_000_000_000; // 1.0 scaled by 1e9
 
-        market.fee_balance   = 0;
-        market.lp_withdrawn  = true;
+        market.fee_balance  = 0;
+        market.lp_withdrawn = true;
 
-        if lp_recovery > 0 {
+        if withdrawable_amount > 0 {
             let game_id_bytes = market.game_id.to_le_bytes();
             let market_idx    = [market.market_index];
             let vault_bump    = [market.vault_bump];
@@ -448,14 +427,14 @@ pub mod prediction_market {
                     },
                     &[vault_seeds],
                 ),
-                lp_recovery,
+                withdrawable_amount,
             )?;
         }
 
         emit!(LPWithdrawn {
             game_id:      market.game_id,
             market_index: market.market_index,
-            amount:       lp_recovery,
+            amount:       withdrawable_amount,
             timestamp:    clock.unix_timestamp,
         });
 
@@ -467,8 +446,8 @@ pub mod prediction_market {
         let market = &ctx.accounts.market;
 
         require!(ctx.accounts.authority.key() == ADMIN_PUBKEY, MarketError::UnauthorizedUser);
-        require!(market.resolved,     MarketError::MarketNotResolved);
-        require!(market.lp_withdrawn, MarketError::LpNotYetWithdrawn);
+        
+        // Only this check needed here — resolved + lp_withdrawn handled by account constraints
         require!(
             clock.unix_timestamp > market.resolved_at + CLAIM_WINDOW_SECS,
             MarketError::ClaimWindowNotOver
@@ -484,18 +463,18 @@ pub mod prediction_market {
         // 1. Transfer remaining tokens to admin
         if remaining > 0 {
             token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from:      ctx.accounts.vault.to_account_info(),
-                    to:        ctx.accounts.admin_token_account.to_account_info(),
-                    authority: ctx.accounts.vault.to_account_info(),
-                },
-                &[vault_seeds],
-            ),
-            remaining,
-        )?;
-    }
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from:      ctx.accounts.vault.to_account_info(),
+                        to:        ctx.accounts.admin_token_account.to_account_info(),
+                        authority: ctx.accounts.vault.to_account_info(),
+                    },
+                    &[vault_seeds],
+                ),
+                remaining,
+            )?;
+        }
 
         // 2. Close vault token account — returns rent to authority
         token::close_account(
