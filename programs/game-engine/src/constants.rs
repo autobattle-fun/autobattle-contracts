@@ -9,7 +9,7 @@ pub const PREDICTION_MARKET_PROGRAM_ID: Pubkey = solana_program::pubkey!(
     "H76M7bbm6zwE464xkabF5MWbciwZqK9FmZYf4omaqnQH"
 );
 pub const ADMIN_PUBKEY: Pubkey = solana_program::pubkey!(
-    "G2eWnQNwc1wrrgE78NcjmLBXXT9h2s9iUwAM1C8kpFzK"
+    "HoJyHfkwmb9vSRpCiKS2XYQvgWNNGp2DZfk62coMJv26"
 );
 
 pub const DEFAULT_COOLDOWN_SECS: i64 = 300;

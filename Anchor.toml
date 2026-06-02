@@ -2,7 +2,7 @@
 seeds = false
 skip-lint = false
 
-[programs.localnet]
+[programs.mainnet]
 game_engine       = "GxLT8QMUw6cVT6HQBu2c2zepbQnhUWr4VPEB2vfggE2e"
 prediction_market = "H76M7bbm6zwE464xkabF5MWbciwZqK9FmZYf4omaqnQH"
 
@@ -10,8 +10,8 @@ prediction_market = "H76M7bbm6zwE464xkabF5MWbciwZqK9FmZYf4omaqnQH"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "devnet"
-wallet = "~/.config/solana/id.json"
+cluster = "mainnet"
+wallet = "./mainnet-deployer.json" 
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"

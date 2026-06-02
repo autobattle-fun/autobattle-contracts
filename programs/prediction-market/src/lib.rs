@@ -19,7 +19,7 @@ pub const VAULT_SEED: &[u8]     = b"vault";
 pub const POSITION_SEED: &[u8]  = b"position";
 
 /// The wallet used by the Deforge AI Backend to resolve mid-game proposals
-pub const ADMIN_PUBKEY: Pubkey = solana_program::pubkey!("G2eWnQNwc1wrrgE78NcjmLBXXT9h2s9iUwAM1C8kpFzK");
+pub const ADMIN_PUBKEY: Pubkey = solana_program::pubkey!("HoJyHfkwmb9vSRpCiKS2XYQvgWNNGp2DZfk62coMJv26");
 
 pub const GAME_ENGINE_PROGRAM_ID: Pubkey = solana_program::pubkey!(
     "GxLT8QMUw6cVT6HQBu2c2zepbQnhUWr4VPEB2vfggE2e"

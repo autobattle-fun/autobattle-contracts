@@ -38,3 +38,4 @@ yarn-error.log*
 .idea/
 *.swp
 .env
+mainnet-deployer.json
