@@ -39,3 +39,4 @@ yarn-error.log*
 *.swp
 .env
 mainnet-deployer.json
+buffer.json

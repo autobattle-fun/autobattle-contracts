@@ -64,4 +64,7 @@ pub enum MarketError {
     
     #[msg("Claim window not yet over — wait 48 hours after resolution.")]
     ClaimWindowNotOver,
+
+    #[msg("Position still has shares — sell first.")]
+    SharesRemaining,
 }
