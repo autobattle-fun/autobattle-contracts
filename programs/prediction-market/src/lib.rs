@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked, CloseAccount};
 
 declare_id!("H76M7bbm6zwE464xkabF5MWbciwZqK9FmZYf4omaqnQH");
 
@@ -10,15 +10,10 @@ pub mod lmsr;
 use state::*;
 use crate::errors::MarketError; 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constants
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub const MARKET_SEED: &[u8]    = b"market";
 pub const VAULT_SEED: &[u8]     = b"vault";
 pub const POSITION_SEED: &[u8]  = b"position";
 
-/// The wallet used by the Deforge AI Backend to resolve mid-game proposals
 pub const ADMIN_PUBKEY: Pubkey = solana_program::pubkey!("HoJyHfkwmb9vSRpCiKS2XYQvgWNNGp2DZfk62coMJv26");
 
 pub const GAME_ENGINE_PROGRAM_ID: Pubkey = solana_program::pubkey!(
@@ -26,25 +21,13 @@ pub const GAME_ENGINE_PROGRAM_ID: Pubkey = solana_program::pubkey!(
 );
 
 pub const LMSR_B_SCALED: u64 = 144_270_000_000;
-
-/// Grace period before a stuck unresolved market can be refunded (3 minutes for demo).
 pub const REFUND_GRACE_SECS: i64 = 180;
-
-// Named constant for initial liquidity
 pub const INITIAL_LIQUIDITY: u64 = 100_000_000_000;
-
-/// 48 hours after resolution, unclaimed winnings can be swept
-pub const CLAIM_WINDOW_SECS: i64 = 172_800; // 48 hours
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Program
-// ─────────────────────────────────────────────────────────────────────────────
+pub const CLAIM_WINDOW_SECS: i64 = 172_800; 
 
 #[program]
 pub mod prediction_market {
     use super::*;
-
-    // ── Market creation ───────────────────────────────────────────────────────
 
     pub fn create_market(
         ctx: Context<CreateMarket>,
@@ -84,22 +67,22 @@ pub mod prediction_market {
             timestamp: clock.unix_timestamp,
         });
 
-        let cpi_accounts = Transfer {
+        let cpi_accounts = TransferChecked {
             from: ctx.accounts.creator_token_account.to_account_info(),
             to: ctx.accounts.vault.to_account_info(),
             authority: ctx.accounts.authority.to_account_info(),
+            mint: ctx.accounts.auto_mint.to_account_info(),
         };
         let cpi_program = ctx.accounts.token_program.to_account_info();
         
-        token::transfer(
+        token_interface::transfer_checked(
             CpiContext::new(cpi_program, cpi_accounts), 
-            INITIAL_LIQUIDITY
+            INITIAL_LIQUIDITY,
+            ctx.accounts.auto_mint.decimals
         )?;
 
         Ok(())
     }
-
-    // ── Trading ───────────────────────────────────────────────────────────────
 
     pub fn buy_shares(
         ctx: Context<BuyShares>,
@@ -117,27 +100,39 @@ pub mod prediction_market {
         let max_allowed_bet = LMSR_B_SCALED.checked_mul(50).ok_or(crate::errors::MarketError::Overflow)?;
         require!(amount_in <= max_allowed_bet, crate::errors::MarketError::BetTooLarge);
 
-        let fee = amount_in.checked_div(100).ok_or(crate::errors::MarketError::Overflow)?;
+        // --- Delta Balance Check for Token-2022 Transfer Fees ---
+        let balance_before = ctx.accounts.vault.amount;
+
+        token_interface::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from:      ctx.accounts.user_token_account.to_account_info(),
+                    to:        ctx.accounts.vault.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                    mint:      ctx.accounts.mint.to_account_info(),
+                },
+            ),
+            amount_in,
+            ctx.accounts.mint.decimals,
+        )?;
+
+        // Force reload of vault account to get true balance after transfer
+        ctx.accounts.vault.reload()?;
+        let balance_after = ctx.accounts.vault.amount;
+        
+        // Calculate exact amount received (protects against fee-on-transfer)
+        let actual_amount_in = balance_after.checked_sub(balance_before).ok_or(crate::errors::MarketError::Overflow)?;
+
+        let fee = actual_amount_in.checked_div(100).ok_or(crate::errors::MarketError::Overflow)?;
         require!(fee > 0, crate::errors::MarketError::TradeTooSmall);
         
-        let trade_amount = amount_in.checked_sub(fee).ok_or(crate::errors::MarketError::Overflow)?;
+        let trade_amount = actual_amount_in.checked_sub(fee).ok_or(crate::errors::MarketError::Overflow)?;
 
         let shares_out = lmsr::calc_shares_out(
             m.yes_supply, m.no_supply, LMSR_B_SCALED, outcome, trade_amount,
         )?;
         require!(shares_out >= min_shares_out, crate::errors::MarketError::SlippageExceeded);
-
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from:      ctx.accounts.user_token_account.to_account_info(),
-                    to:        ctx.accounts.vault.to_account_info(),
-                    authority: ctx.accounts.user.to_account_info(),
-                },
-            ),
-            amount_in,
-        )?;
 
         match outcome {
             Outcome::Yes => m.yes_supply = m.yes_supply.checked_add(shares_out).ok_or(crate::errors::MarketError::Overflow)?,
@@ -168,7 +163,7 @@ pub mod prediction_market {
             market_index: m.market_index,
             user: ctx.accounts.user.key(), 
             outcome, 
-            amount_in, 
+            amount_in: actual_amount_in, 
             shares_out,
             fee, 
         });
@@ -223,17 +218,19 @@ pub mod prediction_market {
         let vault_bump      = [m.vault_bump];
         let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
         
-        token::transfer(
+        token_interface::transfer_checked(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
-                Transfer {
+                TransferChecked {
                     from:      ctx.accounts.vault.to_account_info(),
                     to:        ctx.accounts.user_token_account.to_account_info(),
                     authority: ctx.accounts.vault.to_account_info(),
+                    mint:      ctx.accounts.mint.to_account_info(),
                 },
                 &[vault_seeds],
             ),
             net_amount_out,
+            ctx.accounts.mint.decimals,
         )?;
 
         emit!(SharesSold {
@@ -248,8 +245,6 @@ pub mod prediction_market {
 
         Ok(())
     }
-
-    // ── Resolution ────────────────────────────────────────────────────────────
 
     pub fn resolve_market(
         ctx: Context<ResolveMarket>,
@@ -275,8 +270,6 @@ pub mod prediction_market {
         Ok(())
     }
 
-    // ── Settlement ────────────────────────────────────────────────────────────
-
     pub fn claim_payout(ctx: Context<ClaimPayout>) -> Result<()> {
         let m   = &ctx.accounts.market;
         let pos = &mut ctx.accounts.user_position;
@@ -298,7 +291,6 @@ pub mod prediction_market {
         };
         require!(user_winning_shares > 0, crate::errors::MarketError::NoWinningShares);
 
-        // 1:1 payout
         let payout = user_winning_shares;
         pos.claimed = true;
 
@@ -307,17 +299,19 @@ pub mod prediction_market {
         let vault_bump    = [m.vault_bump];
         let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
 
-        token::transfer(
+        token_interface::transfer_checked(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
-                Transfer {
+                TransferChecked {
                     from:      ctx.accounts.vault.to_account_info(),
                     to:        ctx.accounts.user_token_account.to_account_info(),
                     authority: ctx.accounts.vault.to_account_info(),
+                    mint:      ctx.accounts.mint.to_account_info(),
                 },
                 &[vault_seeds],
             ),
             payout,
+            ctx.accounts.mint.decimals,
         )?;
 
         emit!(PayoutClaimed {
@@ -363,17 +357,20 @@ pub mod prediction_market {
         let market_idx    = [m.market_index];
         let vault_bump    = [m.vault_bump];
         let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
-        token::transfer(
+        
+        token_interface::transfer_checked(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
-                Transfer {
+                TransferChecked {
                     from:      ctx.accounts.vault.to_account_info(),
                     to:        ctx.accounts.user_token_account.to_account_info(),
                     authority: ctx.accounts.vault.to_account_info(),
+                    mint:      ctx.accounts.mint.to_account_info(),
                 },
                 &[vault_seeds],
             ),
             refund,
+            ctx.accounts.mint.decimals,
         )?;
 
         emit!(PositionRefunded {
@@ -401,13 +398,9 @@ pub mod prediction_market {
             Outcome::No  => market.no_supply,
         };
 
-        // ── LP Protection Logic ──────────────────────────────────────
-        // If vault can't cover winning shares, LP gets 0 (not an error)
         let withdrawable_amount = vault_balance.saturating_sub(total_winning_shares);
 
-        // Set ratio to 1:1 — winners always get full share value
-        market.winner_payout_ratio = 1_000_000_000; // 1.0 scaled by 1e9
-
+        market.winner_payout_ratio = 1_000_000_000; 
         market.fee_balance  = 0;
         market.lp_withdrawn = true;
 
@@ -417,17 +410,19 @@ pub mod prediction_market {
             let vault_bump    = [market.vault_bump];
             let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
 
-            token::transfer(
+            token_interface::transfer_checked(
                 CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
-                    Transfer {
+                    TransferChecked {
                         from:      ctx.accounts.vault.to_account_info(),
                         to:        ctx.accounts.admin_token_account.to_account_info(),
                         authority: ctx.accounts.vault.to_account_info(),
+                        mint:      ctx.accounts.mint.to_account_info(),
                     },
                     &[vault_seeds],
                 ),
                 withdrawable_amount,
+                ctx.accounts.mint.decimals,
             )?;
         }
 
@@ -443,11 +438,9 @@ pub mod prediction_market {
 
     pub fn sweep_unclaimed(ctx: Context<SweepUnclaimed>) -> Result<()> {
         let clock  = Clock::get()?;
-        let market = &ctx.accounts.market;
+        let market = &mut ctx.accounts.market;
 
         require!(ctx.accounts.authority.key() == ADMIN_PUBKEY, MarketError::UnauthorizedUser);
-        
-        // Only this check needed here — resolved + lp_withdrawn handled by account constraints
         require!(
             clock.unix_timestamp > market.resolved_at + CLAIM_WINDOW_SECS,
             MarketError::ClaimWindowNotOver
@@ -460,27 +453,27 @@ pub mod prediction_market {
         let vault_bump    = [market.vault_bump];
         let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
 
-        // 1. Transfer remaining tokens to admin
         if remaining > 0 {
-            token::transfer(
+            token_interface::transfer_checked(
                 CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
-                    Transfer {
+                    TransferChecked {
                         from:      ctx.accounts.vault.to_account_info(),
                         to:        ctx.accounts.admin_token_account.to_account_info(),
                         authority: ctx.accounts.vault.to_account_info(),
+                        mint:      ctx.accounts.mint.to_account_info(),
                     },
                     &[vault_seeds],
                 ),
                 remaining,
+                ctx.accounts.mint.decimals,
             )?;
         }
 
-        // 2. Close vault token account — returns rent to authority
-        token::close_account(
+        token_interface::close_account(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
-                token::CloseAccount {
+                CloseAccount {
                     account:     ctx.accounts.vault.to_account_info(),
                     destination: ctx.accounts.authority.to_account_info(),
                     authority:   ctx.accounts.vault.to_account_info(),
@@ -488,8 +481,6 @@ pub mod prediction_market {
                 &[vault_seeds],
             ),
         )?;
-
-        // 3. Market account closed via `close = authority` in context
 
         emit!(UnclaimedSwept {
             game_id:      market.game_id,
@@ -522,21 +513,22 @@ pub struct CreateMarket<'info> {
         init,
         seeds = [VAULT_SEED, &game_id.to_le_bytes(), &[market_index]],
         bump,
-        payer            = authority,
-        token::mint      = auto_mint,
-        token::authority = vault,
+        payer                = authority,
+        token::mint          = auto_mint,
+        token::authority     = vault,
+        token::token_program = token_program,
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: InterfaceAccount<'info, TokenAccount>,
 
-    pub auto_mint: Account<'info, anchor_spl::token::Mint>,
+    pub auto_mint: InterfaceAccount<'info, Mint>,
 
     #[account(mut)]
-    pub creator_token_account: Account<'info, TokenAccount>,
+    pub creator_token_account: InterfaceAccount<'info, TokenAccount>,
 
     #[account(mut)]
     pub authority: Signer<'info>,
 
-    pub token_program:  Program<'info, Token>,
+    pub token_program:  Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
     pub rent:           Sysvar<'info, Rent>,
 }
@@ -565,18 +557,21 @@ pub struct BuyShares<'info> {
         seeds = [VAULT_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
         bump  = market.vault_bump,
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = user_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
     )]
-    pub user_token_account: Account<'info, TokenAccount>,
+    pub user_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(address = vault.mint)]
+    pub mint: InterfaceAccount<'info, Mint>,
 
     #[account(mut)]
     pub user: Signer<'info>,
 
-    pub token_program:  Program<'info, Token>,
+    pub token_program:  Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -602,18 +597,21 @@ pub struct SellShares<'info> {
         seeds = [VAULT_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
         bump  = market.vault_bump,
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = user_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
     )]
-    pub user_token_account: Account<'info, TokenAccount>,
+    pub user_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(address = vault.mint)]
+    pub mint: InterfaceAccount<'info, Mint>,
 
     #[account(mut)]
     pub user: Signer<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
@@ -660,17 +658,20 @@ pub struct ClaimPayout<'info> {
         seeds = [VAULT_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
         bump  = market.vault_bump,
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = user_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
     )]
-    pub user_token_account: Account<'info, TokenAccount>,
+    pub user_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(address = vault.mint)]
+    pub mint: InterfaceAccount<'info, Mint>,
 
     pub user: Signer<'info>,
 
-    pub token_program:  Program<'info, Token>,
+    pub token_program:  Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -697,17 +698,20 @@ pub struct RefundExpired<'info> {
         seeds = [VAULT_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
         bump  = market.vault_bump,
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = user_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
     )]
-    pub user_token_account: Account<'info, TokenAccount>,
+    pub user_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(address = vault.mint)]
+    pub mint: InterfaceAccount<'info, Mint>,
 
     pub user: Signer<'info>,
 
-    pub token_program:  Program<'info, Token>,
+    pub token_program:  Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -726,13 +730,16 @@ pub struct WithdrawLP<'info> {
         seeds = [VAULT_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
         bump = market.vault_bump,
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = admin_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
     )]
-    pub admin_token_account: Account<'info, TokenAccount>,
+    pub admin_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(address = vault.mint)]
+    pub mint: InterfaceAccount<'info, Mint>,
 
     #[account(
         mut,
@@ -740,7 +747,7 @@ pub struct WithdrawLP<'info> {
     )]
     pub authority: Signer<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
@@ -760,13 +767,16 @@ pub struct SweepUnclaimed<'info> {
         seeds = [VAULT_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
         bump  = market.vault_bump,
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = admin_token_account.mint == vault.mint @ MarketError::InvalidMint,
     )]
-    pub admin_token_account: Account<'info, TokenAccount>,
+    pub admin_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(address = vault.mint)]
+    pub mint: InterfaceAccount<'info, Mint>,
 
     #[account(
         mut,
@@ -774,7 +784,7 @@ pub struct SweepUnclaimed<'info> {
     )]
     pub authority: Signer<'info>,
 
-    pub token_program:  Program<'info, Token>,
+    pub token_program:  Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -798,7 +808,7 @@ pub struct SharesBought {
     pub outcome:      Outcome,
     pub amount_in:    u64,
     pub shares_out:   u64,
-    pub fee:          u64, 
+    pub fee:          u64,
 }
 
 #[event]
@@ -835,7 +845,7 @@ pub struct SharesSold {
     pub outcome:      Outcome,
     pub shares_in:    u64,
     pub amount_out:   u64,
-    pub fee:          u64, 
+    pub fee:          u64,
 }
 
 #[event]
