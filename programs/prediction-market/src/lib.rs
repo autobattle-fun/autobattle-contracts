@@ -23,7 +23,7 @@ pub const GAME_ENGINE_PROGRAM_ID: Pubkey = solana_program::pubkey!(
 pub const LMSR_B_SCALED: u64 = 144_270_000_000;
 pub const INITIAL_LIQUIDITY: u64 = 100_000_000_000;
 
-pub const RESOLVE_DEADLINE_SECS: i64 = 7200; 
+pub const RESOLVE_DEADLINE_SECS: i64 = 172_800; 
 pub const CLAIM_WINDOW_SECS: i64 = 172_800; 
 
 #[program]
@@ -256,7 +256,7 @@ pub mod prediction_market {
 
         require!(
             clock.unix_timestamp <= m.expires_at + RESOLVE_DEADLINE_SECS,
-            crate::errors::MarketError::MarketExpired
+            crate::errors::MarketError::ResolutionDeadlinePassed
         );
 
         m.resolved    = true;
@@ -296,9 +296,11 @@ pub mod prediction_market {
         };
         require!(user_winning_shares > 0, crate::errors::MarketError::NoWinningShares);
 
-        let payout = (user_winning_shares as u128)
+        let payout_u128 = (user_winning_shares as u128)
             .checked_mul(m.winner_payout_ratio as u128).ok_or(crate::errors::MarketError::Overflow)?
-            .checked_div(1_000_000_000).ok_or(crate::errors::MarketError::Overflow)? as u64;
+            .checked_div(1_000_000_000).ok_or(crate::errors::MarketError::Overflow)?;
+            
+        let payout = u64::try_from(payout_u128).map_err(|_| crate::errors::MarketError::Overflow)?;
 
         require!(payout > 0, crate::errors::MarketError::ZeroAmount);
         pos.claimed = true;
@@ -351,13 +353,19 @@ pub mod prediction_market {
         let total_shares  = m.yes_supply.checked_add(m.no_supply).ok_or(crate::errors::MarketError::Overflow)?;
         require!(total_shares > 0, crate::errors::MarketError::ZeroAmount);
         
-        // -- FIX H-3: Isolate INITIAL_LIQUIDITY from the refund pool --
         let vault_balance = ctx.accounts.vault.amount;
-        let refund_pool = vault_balance.saturating_sub(INITIAL_LIQUIDITY);
             
-        let refund = (user_shares as u128)
+        let refund_pool = if m.lp_withdrawn {
+            vault_balance.saturating_sub(m.fee_balance) 
+        } else {
+            vault_balance.saturating_sub(INITIAL_LIQUIDITY).saturating_sub(m.fee_balance)
+        };
+            
+        let refund_u128 = (user_shares as u128)
             .checked_mul(refund_pool as u128).ok_or(crate::errors::MarketError::Overflow)?
-            .checked_div(total_shares as u128).ok_or(crate::errors::MarketError::Overflow)? as u64;
+            .checked_div(total_shares as u128).ok_or(crate::errors::MarketError::Overflow)?;
+            
+        let refund = u64::try_from(refund_u128).map_err(|_| crate::errors::MarketError::Overflow)?;
 
         pos.claimed = true;
         m.yes_supply = m.yes_supply.checked_sub(user_yes).ok_or(crate::errors::MarketError::Overflow)?;
@@ -461,7 +469,7 @@ pub mod prediction_market {
 
     pub fn sweep_unclaimed(ctx: Context<SweepUnclaimed>) -> Result<()> {
         let clock  = Clock::get()?;
-        let market = &mut ctx.accounts.market;
+        let market = &ctx.accounts.market;
 
         require!(ctx.accounts.authority.key() == ADMIN_PUBKEY, MarketError::UnauthorizedUser);
         require!(
@@ -516,16 +524,73 @@ pub mod prediction_market {
     }
     
     pub fn close_position(ctx: Context<ClosePosition>) -> Result<()> {
-        let m = &ctx.accounts.market;
+        let m   = &ctx.accounts.market;
         let pos = &ctx.accounts.user_position;
-        
-        let is_empty = pos.yes_shares == 0 && pos.no_shares == 0;
-        let is_loser = m.resolved && (
-            (m.outcome == Some(Outcome::Yes) && pos.yes_shares == 0) ||
-            (m.outcome == Some(Outcome::No) && pos.no_shares == 0)
-        );
 
-        require!(is_empty || is_loser, crate::errors::MarketError::SharesRemaining);
+        let is_empty = pos.yes_shares == 0 && pos.no_shares == 0;
+
+        let is_loser = m.resolved && match m.outcome {
+            Some(Outcome::Yes) => pos.yes_shares == 0 && pos.no_shares > 0,
+            Some(Outcome::No)  => pos.no_shares  == 0 && pos.yes_shares > 0,
+            None => false,
+        };
+
+        let is_claimed = pos.claimed;
+
+        require!(is_empty || is_loser || is_claimed, crate::errors::MarketError::SharesRemaining);
+        Ok(())
+    }
+
+    pub fn reclaim_expired_lp(ctx: Context<ReclaimExpiredLP>) -> Result<()> {
+        let clock = Clock::get()?;
+        let market = &mut ctx.accounts.market;
+
+        require!(ctx.accounts.authority.key() == ADMIN_PUBKEY, crate::errors::MarketError::UnauthorizedUser);
+        
+        // Ensure the market is dead and can never be resolved
+        require!(!market.resolved, crate::errors::MarketError::MarketAlreadyResolved);
+        require!(
+            clock.unix_timestamp > market.expires_at + RESOLVE_DEADLINE_SECS,
+            crate::errors::MarketError::GracePeriodNotOver
+        );
+        require!(!market.lp_withdrawn, crate::errors::MarketError::LpAlreadyWithdrawn);
+
+        let vault_balance = ctx.accounts.vault.amount;
+        
+        // Safely pull up to the initial liquidity out
+        let amount_to_withdraw = std::cmp::min(INITIAL_LIQUIDITY, vault_balance);
+
+        market.lp_withdrawn = true;
+
+        if amount_to_withdraw > 0 {
+            let game_id_bytes = market.game_id.to_le_bytes();
+            let market_idx    = [market.market_index];
+            let vault_bump    = [market.vault_bump];
+            let vault_seeds: &[&[u8]] = &[VAULT_SEED, &game_id_bytes, &market_idx, &vault_bump];
+
+            token_interface::transfer_checked(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    TransferChecked {
+                        from:      ctx.accounts.vault.to_account_info(),
+                        to:        ctx.accounts.admin_token_account.to_account_info(),
+                        authority: ctx.accounts.vault.to_account_info(),
+                        mint:      ctx.accounts.mint.to_account_info(),
+                    },
+                    &[vault_seeds],
+                ),
+                amount_to_withdraw,
+                ctx.accounts.mint.decimals,
+            )?;
+        }
+
+        emit!(LPWithdrawn {
+            game_id:      market.game_id,
+            market_index: market.market_index,
+            amount:       amount_to_withdraw,
+            timestamp:    clock.unix_timestamp,
+        });
+
         Ok(())
     }
 }
@@ -845,6 +910,40 @@ pub struct ClosePosition<'info> {
     pub user_position: Account<'info, UserPosition>,
 
     pub user: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReclaimExpiredLP<'info> {
+    #[account(
+        mut,
+        seeds = [MARKET_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, Market>,
+
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, &market.game_id.to_le_bytes(), &[market.market_index]],
+        bump = market.vault_bump,
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = admin_token_account.mint == vault.mint @ crate::errors::MarketError::InvalidMint,
+    )]
+    pub admin_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(address = vault.mint)]
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mut,
+        address = ADMIN_PUBKEY @ crate::errors::MarketError::UnauthorizedUser,
+    )]
+    pub authority: Signer<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

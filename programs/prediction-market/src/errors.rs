@@ -67,4 +67,7 @@ pub enum MarketError {
 
     #[msg("Position still has shares — sell first.")]
     SharesRemaining,
+
+    #[msg("The resolution deadline for this market has passed.")]
+    ResolutionDeadlinePassed,
 }
